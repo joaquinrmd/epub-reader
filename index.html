@@ -13,10 +13,8 @@
 
   <link rel="stylesheet" href="styles.css">
   <link rel="manifest" href="manifest.json">
-  <!-- Icono para iOS (Safari no usa el manifest aún para iconos) -->
   <link rel="apple-touch-icon" href="icons/icon-192.svg">
 
-  <!-- JSZip para parsear EPUBs -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
 </head>
 <body>
@@ -56,18 +54,15 @@
       <div id="book-title-display">Mi Lector</div>
 
       <div id="header-controls">
-        <!-- Control de tamaño de fuente -->
         <div id="font-controls">
           <button class="btn-font" id="btn-font-minus" onclick="changeFontSize(-1)" title="Texto más pequeño">A−</button>
           <button class="btn-font" id="btn-font-plus"  onclick="changeFontSize(+1)" title="Texto más grande">A+</button>
         </div>
 
-        <!-- Toggle de tema -->
         <button id="btn-theme" onclick="cycleTheme()" title="Cambiar tema">☀</button>
 
         <div class="header-sep"></div>
 
-        <!-- Tabs Leer / Subrayados -->
         <div id="tabs">
           <button class="tab active" onclick="showTab('reader')">Leer</button>
           <button class="tab"        onclick="showTab('highlights')">Subrayados</button>
@@ -75,18 +70,25 @@
       </div>
     </div>
 
-    <!-- COLOR BAR -->
+    <!-- COLOR BAR — incluye botón de marcador -->
     <div id="color-bar">
       <span>Color:</span>
       <div class="color-dot active" id="color-yellow" onclick="setColor('yellow')" title="Amarillo"></div>
       <div class="color-dot"        id="color-blue"   onclick="setColor('blue')"   title="Azul"></div>
       <div class="color-dot"        id="color-green"  onclick="setColor('green')"  title="Verde"></div>
       <div class="color-dot"        id="color-pink"   onclick="setColor('pink')"   title="Rosa"></div>
+
+      <div style="flex:1;"></div>
+
+      <button id="btn-bookmark" onclick="addBookmark()" title="Guardar posición actual">
+        🔖 Marcar
+      </button>
     </div>
 
     <!-- CONTENT -->
     <div id="content">
-      <!-- Vista de lectura -->
+
+      <!-- Vista de lectura — los capítulos se renderizan aquí dinámicamente -->
       <div id="reader-view">
         <div id="empty-reader">
           Sube un epub o txt para empezar a leer.<br><br>
@@ -102,11 +104,20 @@
             <button id="export-btn" onclick="exportTxt()">Exportar .txt</button>
           </div>
         </div>
+
+        <!-- Marcadores -->
+        <div id="bookmarks-section">
+          <div id="bookmarks-header">🔖 Marcadores</div>
+          <div id="bookmarks-list"></div>
+        </div>
+
+        <!-- Highlights -->
         <div id="hl-list"></div>
       </div>
-    </div>
 
-    <!-- STATUS BAR -->
+    </div><!-- /content -->
+
+    <!-- STATUS BAR — muestra capítulo y porcentaje -->
     <div id="status-bar">
       <span id="status-text">Listo</span>
       <span id="sync-indicator"></span>
