@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#1c1c1c"/>
+  <!-- Book spine -->
+  <rect x="136" y="96" width="72" height="320" rx="10" fill="#c8956c"/>
+  <!-- Book cover -->
+  <rect x="192" y="96" width="188" height="320" rx="10" fill="#e8b68a"/>
+  <!-- Pages -->
+  <rect x="202" y="106" width="168" height="300" rx="6" fill="#f7f4ef"/>
+  <!-- Text lines -->
+  <rect x="222" y="168" width="128" height="8" rx="4" fill="#d4cdc4"/>
+  <rect x="222" y="186" width="110" height="8" rx="4" fill="#d4cdc4"/>
+  <rect x="222" y="204" width="120" height="8" rx="4" fill="#d4cdc4"/>
+  <rect x="222" y="222" width="96" height="8" rx="4" fill="#d4cdc4"/>
+  <!-- Highlight (yellow) -->
+  <rect x="222" y="240" width="128" height="14" rx="7" fill="rgba(253,224,71,0.7)"/>
+  <rect x="222" y="264" width="104" height="8" rx="4" fill="#d4cdc4"/>
+  <rect x="222" y="282" width="118" height="8" rx="4" fill="#d4cdc4"/>
+  <rect x="222" y="300" width="90" height="8" rx="4" fill="#d4cdc4"/>
+  <!-- Spine decoration -->
+  <rect x="148" y="244" width="48" height="2" rx="1" fill="#a07050" opacity="0.5"/>
+</svg>
