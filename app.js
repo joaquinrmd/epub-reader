@@ -650,13 +650,20 @@ async function calculatePages(anchorParaIdx = null) {
   if (!allParagraphs.length || isPaginating) return;
   isPaginating = true;
 
+  // Esperar a que carguen las fuentes web antes de medir
+  // Si Lora no está cargada, las medidas quedan incorrectas
+  if (document.fonts && document.fonts.ready) {
+    await document.fonts.ready;
+  }
+  await new Promise(r => setTimeout(r, 60)); // pequeño buffer extra
+
   const measurer    = document.getElementById('page-measurer');
   const pageContent = document.getElementById('page-content');
   const rect        = pageContent.getBoundingClientRect();
-  const innerWidth  = Math.max(rect.width - 120, 180);   // menos padding
-  // rect.height ya excluye la barra de estado (es sibling, no hijo)
-  // Solo restar padding top(36) + bottom(52) + margen de seguridad(16)
-  const pageHeight  = Math.max(rect.height - 104, 200);
+  const innerWidth  = Math.max(rect.width - 120, 180);
+  // rect.height ya excluye la barra de estado
+  // Restar padding top(36) + bottom(52) + margen de seguridad amplio(48)
+  const pageHeight  = Math.max(rect.height - 136, 200);
 
   measurer.style.width    = innerWidth + 'px';
   measurer.style.fontSize = prefs.fontSize + 'px';
