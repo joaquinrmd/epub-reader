@@ -1,7 +1,21 @@
-/* ══════════════════════════════════════════════════
-   Mi Lector — app.js  (v3 CSS Columns)
-   El browser calcula los saltos de página — sin errores
-   ══════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════
+   Mi Lector — app.js  (v4 — paginación robusta)
+
+   Cambios principales vs v3:
+   • Motor de paginación nuevo: el padding visual está en #reader-view
+     (no en #page-content), y W/H de columnas se calculan a partir del
+     padding-box interior del viewer. Esto elimina el bug de
+     "múltiples columnas simultáneas" y la última línea tapada.
+   • ResizeObserver: repagina al rotar iPad, redimensionar, etc.
+   • Repaginación al volver a la pestaña Leer (si estuvo oculta).
+   • Restauración de posición vía paragraph anchor (no pageIdx).
+   • Highlights con paraIdx + texto (más robustos al re-paginar);
+     fallback compatible con highlights viejos.
+   • document.fonts.ready + 2x rAF antes de medir.
+   • translate3d para forzar GPU acceleration en Safari.
+
+   COMPATIBLE: esquemas de IndexedDB y Drive intactos.
+   ════════════════════════════════════════════════════════════════ */
 'use strict';
 
 const CLIENT_ID   = '602238897882-g752d4mbev0d2leg8fvnq7lqt6jsof8l.apps.googleusercontent.com';
@@ -14,32 +28,43 @@ const FONT_MAX    = 22;
 const THEMES      = ['day', 'sepia', 'night'];
 const THEME_ICONS = { day: '☀', sepia: '📜', night: '🌙' };
 
+// ── Estado global ──
 let state = { books: [], highlights: [], currentBookId: null, nextId: 1 };
 let prefs = { theme: 'day', fontSize: 17 };
 
-// CSS Columns state
+// ── Estado del libro abierto ──
 let allParagraphs       = [];
-let anchorMap           = {};
-let fileChapterMap      = {};
-let chapterFirstPage    = {};
-let paragraphPageMap    = {};
+let anchorMap           = {};   // { anchorId → paraIdx }  (links internos)
+let fileChapterMap      = {};   // { filename → chapterIndex }
+let chapterFirstPage    = {};   // { chapterIndex → pageIdx }
+let paragraphPageMap    = {};   // { paraIdx → pageIdx }
+let currentBookChapters = [];
+
+// ── Estado de paginación ──
+let pageWidth           = 0;    // ancho de columna = ancho interior del viewer
+let pageHeight          = 0;    // alto de columna = alto interior del viewer
+let totalPages          = 0;
 let currentPageIdx      = 0;
 let currentChapterIndex = 0;
 let totalChapters       = 0;
-let totalPages          = 0;
-let currentBookChapters = [];
+let needsRepagination   = false;
+let currentTab          = 'reader';
+
+// ── UI ──
 let currentColor        = 'yellow';
 
-let driveReady  = false;
-let driveFileId = null;
-let tokenClient = null;
-let driveTimer  = null;
-let saveTimer   = null;
+// ── Drive ──
+let driveReady   = false;
+let driveFileId  = null;
+let tokenClient  = null;
+let driveTimer   = null;
+let saveTimer    = null;
+let resizeTimer  = null;
 let db;
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  INDEXEDDB
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -89,11 +114,11 @@ async function dbDeleteAllByIndex(sn, in_, val) {
   for (const item of items) await dbDelete(sn, item.id).catch(() => {});
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  INIT
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
-window.onload = async () => {
+window.addEventListener('load', async () => {
   showLoading('Iniciando...');
   try {
     db = await openDB();
@@ -101,6 +126,9 @@ window.onload = async () => {
     await loadState();
     applyPrefs();
     renderSidebar();
+    setupNavigation();
+    setupResizeObserver();
+    setupFontsReadyHook();
     if (state.currentBookId) await selectBook(state.currentBookId);
     renderHighlights();
   } catch (e) {
@@ -109,9 +137,10 @@ window.onload = async () => {
   }
   hideLoading();
   loadGapiScript();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
-  setupNavigation();
-};
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+});
 
 async function migrateFromLocalStorage() {
   try {
@@ -119,21 +148,26 @@ async function migrateFromLocalStorage() {
     if (!raw) return;
     const old = JSON.parse(raw);
     for (const b of (old.books || [])) {
-      if (!(await dbGet('books', b.id)))
-        await dbPut('books', { id: b.id, title: b.title, author: b.author || '',
-          chapters: [{ index: 0, title: null, html: b.html || '', filename: '' }], coverBase64: null });
+      if (!(await dbGet('books', b.id))) {
+        await dbPut('books', {
+          id: b.id, title: b.title, author: b.author || '',
+          chapters: [{ index: 0, title: null, html: b.html || '', filename: '' }],
+          coverBase64: null
+        });
+      }
     }
-    for (const h of (old.highlights || []))
+    for (const h of (old.highlights || [])) {
       if (!(await dbGet('highlights', h.id))) await dbPut('highlights', h);
+    }
     if (old.nextId)        await dbPut('prefs', { key: 'nextId', value: old.nextId });
     if (old.currentBookId) await dbPut('prefs', { key: 'currentBookId', value: old.currentBookId });
     localStorage.removeItem('mi_lector_v2');
-  } catch (e) {}
+  } catch (e) { /* migración silenciosa */ }
 }
 
 async function loadState() {
-  const books     = await dbGetAll('books');
-  state.books     = books.map(b => ({ id: b.id, title: b.title, author: b.author || '' }));
+  const books      = await dbGetAll('books');
+  state.books      = books.map(b => ({ id: b.id, title: b.title, author: b.author || '' }));
   state.highlights = await dbGetAll('highlights');
   const nid = await dbGet('prefs', 'nextId');         state.nextId        = nid ? nid.value : 1;
   const cur = await dbGet('prefs', 'currentBookId');  state.currentBookId = cur ? cur.value : null;
@@ -141,16 +175,19 @@ async function loadState() {
   const fs  = await dbGet('prefs', 'fontSize');       prefs.fontSize      = fs  ? fs.value  : 17;
 }
 
-async function savePref(key, value) { try { await dbPut('prefs', { key, value }); } catch (e) {} }
+async function savePref(key, value) {
+  try { await dbPut('prefs', { key, value }); } catch (e) {}
+}
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  PREFERENCIAS
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 function applyPrefs() {
   document.documentElement.setAttribute('data-theme', prefs.theme);
   document.getElementById('page-content').style.fontSize = prefs.fontSize + 'px';
-  updateThemeBtn(); updateFontBtns();
+  updateThemeBtn();
+  updateFontBtns();
 }
 
 function cycleTheme() {
@@ -169,34 +206,14 @@ async function changeFontSize(delta) {
   prefs.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, prefs.fontSize + delta));
   if (prefs.fontSize === old) return;
 
-  const container = document.getElementById('page-content');
-  const viewer    = document.getElementById('reader-view');
-  const anchorIdx = getFirstVisibleParaIdx(viewer);
-
-  container.style.fontSize   = prefs.fontSize + 'px';
-  container.style.transition = 'none';
-  container.style.transform  = 'translateX(0)';
+  document.getElementById('page-content').style.fontSize = prefs.fontSize + 'px';
   savePref('fontSize', prefs.fontSize);
   updateFontBtns();
 
-  if (!allParagraphs.length) return;
-
-  // Re-setear dimensiones con la nueva fuente
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-  const W = viewer.clientWidth;
-  const H = viewer.clientHeight;
-  container.style.height      = H + 'px';
-  container.style.columnWidth = W + 'px';
-
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-  totalPages = Math.max(1, Math.round(container.scrollWidth / W));
-  buildParagraphPageMap(viewer);
-  buildChapterPageMap(viewer);
-
-  const target = paragraphPageMap[anchorIdx] ?? 0;
-  goToPage(Math.min(target, totalPages - 1), null, true);
+  if (allParagraphs.length) {
+    // Repagina conservando el párrafo visible
+    await paginate({ keepAnchor: true });
+  }
 }
 
 function updateFontBtns() {
@@ -206,15 +223,30 @@ function updateFontBtns() {
   if (p) p.disabled = prefs.fontSize >= FONT_MAX;
 }
 
-// ═══════════════════════════════════════════════════
+/* Cuando las fuentes web (Lora/DM Sans) terminan de cargar
+   después del primer paint, re-paginamos para asegurarnos
+   de que las medidas estén correctas. */
+function setupFontsReadyHook() {
+  if (!document.fonts || !document.fonts.ready) return;
+  document.fonts.ready.then(() => {
+    if (allParagraphs.length && currentTab === 'reader') {
+      paginate({ keepAnchor: true });
+    }
+  });
+}
+
+// ════════════════════════════════════════════════════════════════
 //  GOOGLE DRIVE
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 function loadGapiScript() {
   const s1 = document.createElement('script');
   s1.src    = 'https://apis.google.com/js/api.js';
   s1.onload = () => gapi.load('client', () =>
-    gapi.client.init({ apiKey: '', discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'] }));
+    gapi.client.init({
+      apiKey: '',
+      discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest']
+    }));
   document.head.appendChild(s1);
   const s2 = document.createElement('script');
   s2.src = 'https://accounts.google.com/gsi/client';
@@ -242,7 +274,9 @@ function initDrive() {
 async function syncFromDrive() {
   showLoading('Sincronizando con Drive...');
   try {
-    const res   = await gapi.client.drive.files.list({ spaces: 'appDataFolder', q: `name='${DRIVE_FILE}'`, fields: 'files(id,name)' });
+    const res   = await gapi.client.drive.files.list({
+      spaces: 'appDataFolder', q: `name='${DRIVE_FILE}'`, fields: 'files(id,name)'
+    });
     const files = res.result.files;
     if (files && files.length > 0) {
       driveFileId   = files[0].id;
@@ -254,21 +288,32 @@ async function syncFromDrive() {
       await saveToDrive();
       setStatus('Datos guardados en Drive');
     }
-  } catch (e) { setStatus('Error sincronizando — datos locales disponibles'); }
+  } catch (e) {
+    console.error('[Drive sync]', e);
+    setStatus('Error sincronizando — datos locales disponibles');
+  }
   hideLoading();
 }
 
 async function mergeState(remote) {
   const hlIds   = new Set(state.highlights.map(h => h.id));
   const bookIds = new Set(state.books.map(b => b.id));
-  for (const h of (remote.highlights || []))
+  for (const h of (remote.highlights || [])) {
     if (!hlIds.has(h.id)) { state.highlights.push(h); await dbPut('highlights', h); }
-  for (const b of (remote.books || []))
+  }
+  for (const b of (remote.books || [])) {
     if (!bookIds.has(b.id)) {
       state.books.push({ id: b.id, title: b.title, author: b.author || '' });
-      await dbPut('books', { id: b.id, title: b.title, author: b.author || '', chapters: [], coverBase64: null });
+      await dbPut('books', {
+        id: b.id, title: b.title, author: b.author || '',
+        chapters: [], coverBase64: null
+      });
     }
-  if ((remote.nextId || 0) > state.nextId) { state.nextId = remote.nextId; await savePref('nextId', state.nextId); }
+  }
+  if ((remote.nextId || 0) > state.nextId) {
+    state.nextId = remote.nextId;
+    await savePref('nextId', state.nextId);
+  }
 }
 
 async function saveToDrive() {
@@ -278,25 +323,34 @@ async function saveToDrive() {
     try {
       const payload = JSON.stringify({
         books:      state.books.map(b => ({ id: b.id, title: b.title, author: b.author })),
-        highlights: state.highlights, nextId: state.nextId
+        highlights: state.highlights,
+        nextId:     state.nextId
       });
       if (driveFileId) {
-        await gapi.client.request({ path: `/upload/drive/v3/files/${driveFileId}`, method: 'PATCH', params: { uploadType: 'media' }, body: payload });
+        await gapi.client.request({
+          path: `/upload/drive/v3/files/${driveFileId}`,
+          method: 'PATCH', params: { uploadType: 'media' }, body: payload
+        });
       } else {
-        const meta  = await gapi.client.drive.files.create({ resource: { name: DRIVE_FILE, parents: ['appDataFolder'] }, fields: 'id' });
+        const meta = await gapi.client.drive.files.create({
+          resource: { name: DRIVE_FILE, parents: ['appDataFolder'] }, fields: 'id'
+        });
         driveFileId = meta.result.id;
-        await gapi.client.request({ path: `/upload/drive/v3/files/${driveFileId}`, method: 'PATCH', params: { uploadType: 'media' }, body: payload });
+        await gapi.client.request({
+          path: `/upload/drive/v3/files/${driveFileId}`,
+          method: 'PATCH', params: { uploadType: 'media' }, body: payload
+        });
       }
       const ind = document.getElementById('sync-indicator');
       ind.textContent = 'Guardado ✓';
       setTimeout(() => { ind.textContent = ''; }, 2000);
-    } catch (e) {}
+    } catch (e) { console.error('[saveToDrive]', e); }
   }, 1200);
 }
 
-// ═══════════════════════════════════════════════════
-//  EPUB PARSER
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  EPUB / TXT — IMPORT
+// ════════════════════════════════════════════════════════════════
 
 document.getElementById('file-input').addEventListener('change', async e => {
   for (const file of Array.from(e.target.files)) {
@@ -304,7 +358,10 @@ document.getElementById('file-input').addEventListener('change', async e => {
     try {
       if (file.name.toLowerCase().endsWith('.epub')) await loadEpub(file);
       else                                           await loadTxt(file);
-    } catch (err) { setStatus('Error cargando ' + file.name); }
+    } catch (err) {
+      console.error('[loadFile]', err);
+      setStatus('Error cargando ' + file.name);
+    }
     hideLoading();
   }
   e.target.value = '';
@@ -314,39 +371,61 @@ async function loadEpub(file) {
   const zip = await JSZip.loadAsync(file);
   let title = file.name.replace(/\.epub$/i, ''), author = '', chapters = [], coverBase64 = null;
 
+  // 1. OPF via container.xml
   let opfPath = null;
   const cf = zip.files['META-INF/container.xml'];
-  if (cf) { const t = await cf.async('text'); const m = t.match(/full-path="([^"]+)"/i); if (m) opfPath = m[1]; }
+  if (cf) {
+    const t = await cf.async('text');
+    const m = t.match(/full-path="([^"]+)"/i);
+    if (m) opfPath = m[1];
+  }
   if (!opfPath) opfPath = Object.keys(zip.files).find(f => f.toLowerCase().endsWith('.opf'));
   if (!opfPath) { await loadEpubFallback(zip, title); return; }
 
   const opfText  = await zip.files[opfPath].async('text');
   const basePath = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
 
+  // 2. Metadatos
   const tm = opfText.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/i);
   const am = opfText.match(/<dc:creator[^>]*>([^<]+)<\/dc:creator>/i);
   if (tm) title  = tm[1].trim();
   if (am) author = am[1].trim();
 
+  // 3. Manifest
   const manifest = {};
   for (const m of opfText.matchAll(/<item\s[^>]*>/gi)) {
     const tag = m[0];
-    const idM = tag.match(/\bid="([^"]+)"/), hrefM = tag.match(/\bhref="([^"]+)"/);
-    const tpM = tag.match(/\bmedia-type="([^"]+)"/), prM = tag.match(/\bproperties="([^"]+)"/);
-    if (idM && hrefM) manifest[idM[1]] = { href: hrefM[1], mediaType: tpM ? tpM[1] : '', properties: prM ? prM[1] : '' };
+    const idM = tag.match(/\bid="([^"]+)"/);
+    const hrefM = tag.match(/\bhref="([^"]+)"/);
+    const tpM = tag.match(/\bmedia-type="([^"]+)"/);
+    const prM = tag.match(/\bproperties="([^"]+)"/);
+    if (idM && hrefM) {
+      manifest[idM[1]] = {
+        href: hrefM[1],
+        mediaType: tpM ? tpM[1] : '',
+        properties: prM ? prM[1] : ''
+      };
+    }
   }
 
+  // 4. Portada
   const coverItem = Object.values(manifest).find(i =>
-    i.properties.includes('cover-image') || (/image\/(jpeg|png|webp)/.test(i.mediaType) && i.href.toLowerCase().includes('cover')));
+    i.properties.includes('cover-image') ||
+    (/image\/(jpeg|png|webp)/.test(i.mediaType) && i.href.toLowerCase().includes('cover'))
+  );
   if (coverItem) {
     try {
       const cp = resolvePath(basePath, coverItem.href);
       const cf2 = zip.files[cp] || zip.files[Object.keys(zip.files).find(k => k.endsWith(coverItem.href))];
-      if (cf2) { const bytes = await cf2.async('base64'); coverBase64 = `data:${coverItem.mediaType};base64,${bytes}`; }
+      if (cf2) {
+        const bytes = await cf2.async('base64');
+        coverBase64 = `data:${coverItem.mediaType};base64,${bytes}`;
+      }
     } catch (e) {}
   }
 
-  const spineIds     = [...opfText.matchAll(/idref="([^"]+)"/g)].map(m => m[1]);
+  // 5. Spine + títulos de capítulos
+  const spineIds      = [...opfText.matchAll(/idref="([^"]+)"/g)].map(m => m[1]);
   const chapterTitles = await extractChapterTitles(zip, manifest, basePath, spineIds);
   let chapCount = 0;
 
@@ -362,7 +441,12 @@ async function loadEpub(file) {
     if (!body) continue;
     const cleaned = cleanEpubHtml(body[1]);
     if (!cleaned.trim()) continue;
-    chapters.push({ index: chapCount++, title: chapterTitles[i] || null, html: cleaned, filename: href.split('/').pop() });
+    chapters.push({
+      index: chapCount++,
+      title: chapterTitles[i] || null,
+      html: cleaned,
+      filename: href.split('/').pop()
+    });
   }
 
   if (!chapters.length) { await loadEpubFallback(zip, title); return; }
@@ -371,7 +455,9 @@ async function loadEpub(file) {
 
 async function extractChapterTitles(zip, manifest, basePath, spineIds) {
   const titles = {};
-  const ncxItem = Object.values(manifest).find(i => i.href.endsWith('.ncx') || i.mediaType === 'application/x-dtbncx+xml');
+  // EPUB2: NCX
+  const ncxItem = Object.values(manifest).find(i =>
+    i.href.endsWith('.ncx') || i.mediaType === 'application/x-dtbncx+xml');
   if (ncxItem) {
     try {
       const np = resolvePath(basePath, ncxItem.href);
@@ -380,12 +466,14 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
         const nt = await nf.async('text');
         for (const m of nt.matchAll(/<navPoint[\s\S]*?<text>([^<]+)<\/text>[\s\S]*?<content[^>]+src="([^"#]+)/g)) {
           const src = m[2].split('/').pop().toLowerCase();
-          const si  = spineIds.findIndex(id => manifest[id] && manifest[id].href.split('/').pop().split('#')[0].toLowerCase() === src);
+          const si  = spineIds.findIndex(id => manifest[id] &&
+            manifest[id].href.split('/').pop().split('#')[0].toLowerCase() === src);
           if (si >= 0 && !titles[si]) titles[si] = m[1].trim();
         }
       }
     } catch (e) {}
   }
+  // EPUB3: NAV
   if (!Object.keys(titles).length) {
     const navItem = Object.values(manifest).find(i => i.properties.includes('nav'));
     if (navItem) {
@@ -396,7 +484,8 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
           const nvt = await nvf.async('text');
           for (const m of nvt.matchAll(/<a[^>]+href="([^"#]*)[^"]*"[^>]*>([^<]+)<\/a>/g)) {
             const src = m[1].split('/').pop().toLowerCase();
-            const si  = spineIds.findIndex(id => manifest[id] && manifest[id].href.split('/').pop().split('#')[0].toLowerCase() === src);
+            const si  = spineIds.findIndex(id => manifest[id] &&
+              manifest[id].href.split('/').pop().split('#')[0].toLowerCase() === src);
             if (si >= 0 && !titles[si]) titles[si] = m[2].trim();
           }
         }
@@ -420,22 +509,31 @@ async function loadEpubFallback(zip, title) {
 function resolvePath(base, href) {
   if (!href || href.startsWith('http')) return href;
   const parts = (base + href).split('/'), resolved = [];
-  for (const p of parts) { if (p === '..') resolved.pop(); else if (p && p !== '.') resolved.push(p); }
+  for (const p of parts) {
+    if (p === '..') resolved.pop();
+    else if (p && p !== '.') resolved.push(p);
+  }
   return resolved.join('/');
 }
 
 function cleanEpubHtml(html) {
   return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<link[^>]*>/gi, '').replace(/<img[^>]*>/gi, '')
-    .replace(/class="[^"]*"/gi, '').replace(/style="[^"]*"/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<link[^>]*>/gi, '')
+    .replace(/<img[^>]*>/gi, '')
+    .replace(/class="[^"]*"/gi, '')
+    .replace(/style="[^"]*"/gi, '')
     .replace(/<\/?(?:html|head|body|meta|title)[^>]*>/gi, '')
-    .replace(/<br\s*\/?>/gi, ' ').trim();
+    .replace(/<br\s*\/?>/gi, ' ')
+    .trim();
 }
 
 async function loadTxt(file) {
-  const text = await file.text(), title = file.name.replace(/\.txt$/i, '');
-  const html = text.split('\n').filter(l => l.trim()).map(l => `<p>${escHtml(l.trim())}</p>`).join('');
+  const text = await file.text();
+  const title = file.name.replace(/\.txt$/i, '');
+  const html = text.split('\n').filter(l => l.trim())
+    .map(l => `<p>${escHtml(l.trim())}</p>`).join('');
   await addBook(title, '', [{ index: 0, title: null, html, filename: '' }], null);
 }
 
@@ -445,56 +543,85 @@ async function addBook(title, author, chapters, coverBase64) {
   state.books.push({ id, title, author });
   await savePref('nextId', state.nextId);
   await savePref('currentBookId', id);
-  saveToDrive(); renderSidebar();
+  saveToDrive();
+  renderSidebar();
   await selectBook(id);
   setStatus(`"${title}" cargado — ${chapters.length} capítulo${chapters.length !== 1 ? 's' : ''}`);
 }
 
-// ═══════════════════════════════════════════════════
-//  SELECCIÓN Y APERTURA
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SELECCIÓN Y APERTURA DE LIBRO
+// ════════════════════════════════════════════════════════════════
 
 async function selectBook(id) {
   state.currentBookId = id;
   await savePref('currentBookId', id);
   const book = state.books.find(b => b.id === id);
   if (!book) return;
-  document.getElementById('book-title-display').textContent = book.title + (book.author ? ' — ' + book.author : '');
-  renderSidebar(); showTab('reader'); showLoading('Abriendo libro...');
+
+  document.getElementById('book-title-display').textContent =
+    book.title + (book.author ? ' — ' + book.author : '');
+
+  renderSidebar();
+  showTab('reader');
+  showLoading('Abriendo libro...');
+
   try {
     const full = await dbGet('books', id);
-    if (full?.chapters?.length) {
+    if (full && full.chapters && full.chapters.length) {
       await openBook(full);
-    } else if (full?.html) {
-      await openBook({ chapters: [{ index: 0, title: null, html: full.html, filename: '' }] });
+    } else if (full && full.html) {
+      // Migración legacy
+      await openBook({
+        chapters: [{ index: 0, title: null, html: full.html, filename: '' }]
+      });
     } else {
-      document.getElementById('page-content').innerHTML =
-        `<div id="empty-reader" style="padding-top:60px;">
-           Este libro no tiene contenido en este dispositivo.<br><br>
-           <strong style="color:var(--text)">Volvé a subir el EPUB para leerlo aquí.</strong>
-         </div>`;
-      clearNavState();
+      mountEmptyBook('Este libro no tiene contenido en este dispositivo. Volvé a subir el EPUB para leerlo aquí.');
     }
-  } catch (e) { console.error('[selectBook]', e); }
-  hideLoading(); renderHighlights();
+  } catch (e) {
+    console.error('[selectBook]', e);
+    mountEmptyBook('Error al abrir el libro.');
+  }
+  hideLoading();
+  renderHighlights();
 }
 
 async function openBook(fullBook) {
   currentBookChapters = fullBook.chapters;
   totalChapters       = currentBookChapters.length;
-  renderChapterSidebar();
   buildParagraphArray(currentBookChapters);
+  renderChapterSidebar();
+
+  // Marcar el reader-view como "tiene libro" → habilita zonas tappables y oculta empty state
+  document.getElementById('reader-view').classList.add('has-book');
+
+  // Forzar re-render del HTML en el page-content
+  const container = document.getElementById('page-content');
+  container.dataset.rendered = '';
+  container.dataset.bookId = '';
+
   showLoading('Preparando libro...');
-  await layoutBook();
+  await paginate({ keepAnchor: false });
   hideLoading();
   await restorePosition();
 }
 
-// ═══════════════════════════════════════════════════
-//  CONSTRUCCIÓN DE PÁRRAFOS
-// ═══════════════════════════════════════════════════
+function mountEmptyBook(msg) {
+  document.getElementById('reader-view').classList.remove('has-book');
+  document.getElementById('empty-reader').innerHTML = msg.replace(/\n/g, '<br>');
+  const container = document.getElementById('page-content');
+  container.innerHTML = '';
+  container.dataset.rendered = '';
+  container.dataset.bookId = '';
+  clearNavState();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  CONSTRUCCIÓN DEL ARRAY DE PÁRRAFOS
+// ════════════════════════════════════════════════════════════════
 
 const SKIP_TAGS = new Set(['script','style','head','nav','aside','figure','svg']);
+const PARA_TAGS = new Set(['p','h1','h2','h3','h4','h5','h6','blockquote','pre','li','dt','dd']);
 
 function buildParagraphArray(chapters) {
   allParagraphs = []; anchorMap = {}; fileChapterMap = {};
@@ -507,12 +634,10 @@ function buildParagraphArray(chapters) {
   }
 }
 
-const PARA_TAGS = new Set(['p','h1','h2','h3','h4','h5','h6','blockquote','pre','li','dt','dd']);
-
 function extractBlocks(node, ci) {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent.trim();
-    const pt   = node.parentNode?.tagName?.toLowerCase() || '';
+    const pt   = node.parentNode && node.parentNode.tagName ? node.parentNode.tagName.toLowerCase() : '';
     if (text && !PARA_TAGS.has(pt)) addPara(`<p>${escHtml(text)}</p>`, ci, []);
     return;
   }
@@ -550,127 +675,215 @@ function collectIds(el) {
   return ids;
 }
 
-// ═══════════════════════════════════════════════════
-//  LAYOUT — CSS COLUMNS
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  ▼▼▼  MOTOR DE PAGINACIÓN  ▼▼▼
+// ════════════════════════════════════════════════════════════════
 
-async function layoutBook() {
-  const container = document.getElementById('page-content');
+/**
+ * Recalcula la paginación del libro abierto.
+ * @param {Object}  opts
+ * @param {boolean} opts.keepAnchor - si true, conserva el párrafo visible al repaginar
+ */
+async function paginate(opts) {
+  opts = opts || {};
   const viewer    = document.getElementById('reader-view');
+  const container = document.getElementById('page-content');
 
-  // Reset transform y transición
-  container.style.transition  = 'none';
-  container.style.transform   = 'translateX(0)';
+  if (!allParagraphs.length || !currentBookChapters.length) {
+    viewer.classList.remove('has-book');
+    return;
+  }
+
+  // Si el viewer no es visible (display:none), aplazar.
+  if (viewer.offsetWidth === 0 || viewer.offsetHeight === 0) {
+    needsRepagination = true;
+    return;
+  }
+
+  // 1. Capturar párrafo ancla (si aplica) ANTES de modificar nada
+  let anchorIdx = null;
+  if (opts.keepAnchor) anchorIdx = getFirstVisibleParaIdx();
+
+  // 2. Esperar fuentes
+  if (document.fonts && document.fonts.ready) {
+    try { await document.fonts.ready; } catch (e) {}
+  }
+
+  // 3. Reset transform y transición ANTES de medir (las medidas asumen translateX(0))
+  container.style.transition = 'none';
+  container.style.transform  = 'translate3d(0,0,0)';
+
+  // 4. Esperar a que el reflow se asiente
+  await waitForLayout();
+
+  // 5. Medir el padding-box interior del viewer
+  const inner = getViewerInnerSize(viewer);
+  if (inner.W <= 0 || inner.H <= 0) { needsRepagination = true; return; }
+
+  pageWidth  = inner.W;
+  pageHeight = inner.H;
+
+  // 6. Aplicar dimensiones EXACTAS al page-content
   container.style.fontSize    = prefs.fontSize + 'px';
-  currentPageIdx = 0;
-
-  // Esperar fonts antes de medir
-  if (document.fonts?.ready) await document.fonts.ready;
-  await new Promise(r => requestAnimationFrame(r));
-
-  // ── CLAVE: setear height y column-width al tamaño EXACTO del viewer ──
-  // Esto hace que CSS columns fluya horizontalmente en vez de verticalmente
-  const W = viewer.clientWidth;
-  const H = viewer.clientHeight;
-  container.style.height      = H + 'px';
-  container.style.columnWidth = W + 'px';
-  // El strip puede ser tan ancho como necesite — el viewer oculta el resto
+  container.style.height      = inner.H + 'px';
+  container.style.columnWidth = inner.W + 'px';
   container.style.width       = 'max-content';
 
-  // Construir HTML completo con data-para-idx y encabezados de capítulo
+  // 7. Renderizar HTML del libro (si no se hizo ya, o si cambió de libro)
+  const bookKey = String(state.currentBookId);
+  if (container.dataset.rendered !== '1' || container.dataset.bookId !== bookKey) {
+    renderBookHTML(container);
+    container.dataset.rendered = '1';
+    container.dataset.bookId = bookKey;
+  }
+
+  // 8. Esperar reflow tras inyectar HTML/cambiar dimensiones
+  await waitForLayout();
+
+  // 9. Calcular total de páginas — usar scrollWidth + epsilon para evitar redondeos
+  totalPages = Math.max(1, Math.ceil((container.scrollWidth - 1) / pageWidth));
+
+  // 10. Construir mapas paragraph→page y chapter→page
+  buildParagraphPageMap(container);
+  buildChapterPageMap(container);
+
+  // 11. Aplicar highlights guardados
+  applyHighlightsToContent();
+
+  // 12. Decidir página destino
+  let target = currentPageIdx;
+  if (anchorIdx != null && paragraphPageMap[anchorIdx] !== undefined) {
+    target = paragraphPageMap[anchorIdx];
+  } else {
+    target = Math.min(currentPageIdx, totalPages - 1);
+  }
+  if (target < 0) target = 0;
+
+  goToPage(target, true);
+  needsRepagination = false;
+}
+
+function getViewerInnerSize(viewer) {
+  const cs = getComputedStyle(viewer);
+  const padTop    = parseFloat(cs.paddingTop)    || 0;
+  const padBottom = parseFloat(cs.paddingBottom) || 0;
+  const padLeft   = parseFloat(cs.paddingLeft)   || 0;
+  const padRight  = parseFloat(cs.paddingRight)  || 0;
+  // Math.floor para garantizar que el contenido no se desborda por subpíxeles
+  return {
+    W: Math.floor(viewer.clientWidth  - padLeft - padRight),
+    H: Math.floor(viewer.clientHeight - padTop  - padBottom)
+  };
+}
+
+function waitForLayout() {
+  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+}
+
+function renderBookHTML(container) {
   let html = '', lastCi = -1;
   for (let i = 0; i < allParagraphs.length; i++) {
     const para = allParagraphs[i];
     const ci   = para.chapterIndex;
-    if (ci !== lastCi) {
-      if (lastCi >= 0 && ci > 0) {
-        const ch = currentBookChapters[ci];
-        if (ch?.title)
-          html += `<div class="chapter-header-inline" data-chapter="${ci}">${escHtml(ci + 1 + '. ' + ch.title)}</div>`;
-      }
-      lastCi = ci;
+    if (ci !== lastCi && ci > 0) {
+      const ch = currentBookChapters[ci];
+      const lbl = ch && ch.title ? `${ci + 1}. ${ch.title}` : `Capítulo ${ci + 1}`;
+      html += `<div class="chapter-header-inline" data-chapter="${ci}">${escHtml(lbl)}</div>`;
     }
+    lastCi = ci;
     const withIdx = para.html.replace(/^(<[a-z][a-z0-9]*)/i, `$1 data-para-idx="${i}"`);
     html += processLinksForRender(withIdx);
   }
-
   container.innerHTML = html;
-
-  // Segundo reflow para que el browser calcule el scrollWidth correcto
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-  totalPages = Math.max(1, Math.round(container.scrollWidth / W));
-  buildParagraphPageMap(viewer);
-  buildChapterPageMap(viewer);
-  applyHighlightsToPage();
 }
 
-function computeTotalPages(container, viewer) {
-  return Math.max(1, Math.round(container.scrollWidth / viewer.clientWidth));
-}
-
-function buildParagraphPageMap(viewer) {
+function buildParagraphPageMap(container) {
   paragraphPageMap = {};
-  const vr = viewer.getBoundingClientRect(), vw = viewer.clientWidth;
-  document.getElementById('page-content').querySelectorAll('[data-para-idx]').forEach(el => {
-    const idx    = parseInt(el.dataset.paraIdx, 10);
-    const rect   = el.getBoundingClientRect();
-    const absL   = rect.left - vr.left + currentPageIdx * vw;
-    paragraphPageMap[idx] = Math.max(0, Math.round(absL / vw));
-  });
-}
-
-function buildChapterPageMap(viewer) {
-  chapterFirstPage = { 0: 0 };
-  const vr = viewer.getBoundingClientRect(), vw = viewer.clientWidth;
-  document.getElementById('page-content').querySelectorAll('[data-chapter]').forEach(el => {
-    const ci   = parseInt(el.dataset.chapter, 10);
-    const absL = el.getBoundingClientRect().left - vr.left + currentPageIdx * vw;
-    if (!(ci in chapterFirstPage)) chapterFirstPage[ci] = Math.max(0, Math.round(absL / vw));
-  });
-}
-
-function getFirstVisibleParaIdx(viewer) {
-  const vr = viewer.getBoundingClientRect(), vw = viewer.clientWidth;
-  const els = document.getElementById('page-content').querySelectorAll('[data-para-idx]');
-  for (const el of els) {
+  // El container está en translate(0) — sus rects son absolutas pero coherentes.
+  const containerRect = container.getBoundingClientRect();
+  const W = pageWidth;
+  if (W <= 0) return;
+  container.querySelectorAll('[data-para-idx]').forEach(el => {
+    const idx = parseInt(el.dataset.paraIdx, 10);
     const rect = el.getBoundingClientRect();
-    if (rect.left >= vr.left - 10 && rect.left < vr.left + vw - 10) return parseInt(el.dataset.paraIdx, 10);
+    const offsetX = rect.left - containerRect.left;
+    paragraphPageMap[idx] = Math.max(0, Math.floor(offsetX / W));
+  });
+}
+
+function buildChapterPageMap(container) {
+  chapterFirstPage = { 0: 0 };
+  const containerRect = container.getBoundingClientRect();
+  const W = pageWidth;
+  if (W <= 0) return;
+  container.querySelectorAll('[data-chapter]').forEach(el => {
+    const ci = parseInt(el.dataset.chapter, 10);
+    const rect = el.getBoundingClientRect();
+    const offsetX = rect.left - containerRect.left;
+    if (!(ci in chapterFirstPage)) {
+      chapterFirstPage[ci] = Math.max(0, Math.floor(offsetX / W));
+    }
+  });
+}
+
+function getFirstVisibleParaIdx() {
+  const viewer    = document.getElementById('reader-view');
+  const container = document.getElementById('page-content');
+  if (!viewer || !container) return null;
+  const cs = getComputedStyle(viewer);
+  const padLeft = parseFloat(cs.paddingLeft) || 0;
+  const padRight = parseFloat(cs.paddingRight) || 0;
+  const vr = viewer.getBoundingClientRect();
+  const innerLeft  = vr.left + padLeft;
+  const innerRight = vr.right - padRight;
+  const els = container.querySelectorAll('[data-para-idx]');
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (r.right > innerLeft + 4 && r.left < innerRight - 4) {
+      return parseInt(el.dataset.paraIdx, 10);
+    }
   }
-  return 0;
+  return null;
 }
 
 function clearNavState() {
   currentPageIdx = 0; currentChapterIndex = 0; totalPages = 0;
   allParagraphs = []; paragraphPageMap = {}; chapterFirstPage = {};
+  currentBookChapters = []; totalChapters = 0;
   const c = document.getElementById('page-content');
-  c.style.transition = 'none'; c.style.transform = 'translateX(0)';
+  c.style.transition = 'none';
+  c.style.transform  = 'translate3d(0,0,0)';
   updateNavButtons(); updateStatusBar();
   document.getElementById('chapter-section').classList.remove('visible');
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  NAVEGACIÓN
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
-function goToPage(idx, direction = null, skipTransition = false) {
-  if (idx < 0 || idx >= totalPages) return;
+function goToPage(idx, skipTransition) {
+  if (!totalPages) return;
+  idx = Math.max(0, Math.min(idx, totalPages - 1));
   currentPageIdx = idx;
+
   const container = document.getElementById('page-content');
-  const viewer    = document.getElementById('reader-view');
   container.style.transition = skipTransition ? 'none' : 'transform 0.18s ease';
-  container.style.transform  = `translateX(${-idx * viewer.clientWidth}px)`;
-  currentChapterIndex = getCurrentChapter(idx);
-  updateStatusBar(); updateNavButtons(); updateChapterSidebar();
+  container.style.transform  = `translate3d(${-idx * pageWidth}px, 0, 0)`;
+
+  currentChapterIndex = computeCurrentChapter(idx);
+  updateStatusBar();
+  updateNavButtons();
+  updateChapterSidebar();
+
   clearTimeout(saveTimer);
   saveTimer = setTimeout(savePosition, 600);
 }
 
-function getCurrentChapter(pageIdx) {
+function computeCurrentChapter(pageIdx) {
   let ch = 0;
-  for (const [ci, fp] of Object.entries(chapterFirstPage)) {
-    const c = parseInt(ci);
-    if (fp <= pageIdx && c > ch) ch = c;
+  for (const ciStr in chapterFirstPage) {
+    const ci = parseInt(ciStr, 10);
+    if (chapterFirstPage[ci] <= pageIdx && ci > ch) ch = ci;
   }
   return ch;
 }
@@ -679,29 +892,83 @@ function nextPage() { if (currentPageIdx < totalPages - 1) goToPage(currentPageI
 function prevPage() { if (currentPageIdx > 0)              goToPage(currentPageIdx - 1); }
 
 function goToChapter(ci) {
-  for (let i = ci; i < totalChapters; i++) { if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; } }
-  for (let i = ci - 1; i >= 0; i--)        { if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; } }
+  for (let i = ci; i < totalChapters; i++) {
+    if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; }
+  }
+  for (let i = ci - 1; i >= 0; i--) {
+    if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; }
+  }
 }
 
 function setupNavigation() {
   const viewer = document.getElementById('reader-view');
-  viewer.addEventListener('wheel', e => { e.preventDefault(); if (e.deltaY > 0) nextPage(); else prevPage(); }, { passive: false });
+
+  // Wheel: cambia página, no scrollea
+  let wheelLock = false;
+  viewer.addEventListener('wheel', e => {
+    e.preventDefault();
+    if (wheelLock) return;
+    wheelLock = true;
+    setTimeout(() => { wheelLock = false; }, 220);
+    if (e.deltaY > 0 || e.deltaX > 0) nextPage();
+    else                              prevPage();
+  }, { passive: false });
+
+  // Bloquear scroll/touch nativo dentro del reader
   viewer.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
-  let tx = 0, ty = 0;
-  viewer.addEventListener('touchstart', e => { tx = e.touches[0].clientX; ty = e.touches[0].clientY; }, { passive: true });
-  viewer.addEventListener('touchend', e => {
-    const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
-    if (Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 45) { if (dx < 0) nextPage(); else prevPage(); }
+
+  // Swipe horizontal en touch
+  let tx = 0, ty = 0, tt = 0;
+  viewer.addEventListener('touchstart', e => {
+    tx = e.touches[0].clientX;
+    ty = e.touches[0].clientY;
+    tt = Date.now();
   }, { passive: true });
+  viewer.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - tx;
+    const dy = e.changedTouches[0].clientY - ty;
+    const dt = Date.now() - tt;
+    // Si fue un tap rápido sin desplazamiento, dejamos que la zona tappable lo maneje
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 250) return;
+    if (Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 45) {
+      if (dx < 0) nextPage();
+      else        prevPage();
+    }
+  }, { passive: true });
+
+  // Teclado (sólo en pestaña Leer y fuera de inputs)
   document.addEventListener('keydown', e => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-    if (['ArrowRight','ArrowDown','PageDown'].includes(e.key))  nextPage();
-    if (['ArrowLeft', 'ArrowUp',  'PageUp'].includes(e.key))   prevPage();
+    if (currentTab !== 'reader') return;
+    const t = e.target;
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
+    if (['ArrowRight','ArrowDown','PageDown',' '].includes(e.key)) { e.preventDefault(); nextPage(); }
+    if (['ArrowLeft', 'ArrowUp',  'PageUp'].includes(e.key))       { e.preventDefault(); prevPage(); }
   });
 }
 
+/* ResizeObserver: repagina cuando el viewer cambia de tamaño
+   (rotación de iPad, redimensionar ventana, mostrar/ocultar sidebar...) */
+function setupResizeObserver() {
+  if (!('ResizeObserver' in window)) return;
+  const viewer = document.getElementById('reader-view');
+  let lastW = 0, lastH = 0;
+  const ro = new ResizeObserver(entries => {
+    const cr = entries[0].contentRect;
+    if (Math.abs(cr.width - lastW) < 1 && Math.abs(cr.height - lastH) < 1) return;
+    lastW = cr.width; lastH = cr.height;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(async () => {
+      if (allParagraphs.length && currentTab === 'reader') {
+        await paginate({ keepAnchor: true });
+      }
+    }, 120);
+  });
+  ro.observe(viewer);
+}
+
 function updateNavButtons() {
-  const prev = document.getElementById('btn-prev'), next = document.getElementById('btn-next');
+  const prev = document.getElementById('btn-prev');
+  const next = document.getElementById('btn-next');
   if (!prev || !next) return;
   prev.disabled = currentPageIdx <= 0 || !totalPages;
   next.disabled = currentPageIdx >= totalPages - 1 || !totalPages;
@@ -710,19 +977,22 @@ function updateNavButtons() {
 function updateStatusBar() {
   if (!totalPages) { setStatusDirect('Listo'); return; }
   const ch = currentBookChapters[currentChapterIndex];
-  const cl = ch?.title ? `${currentChapterIndex + 1}. ${ch.title}` : `Cap. ${currentChapterIndex + 1} de ${totalChapters}`;
+  const cl = ch && ch.title
+    ? `${currentChapterIndex + 1}. ${ch.title}`
+    : `Cap. ${currentChapterIndex + 1} de ${totalChapters}`;
   setStatusDirect(`${cl} · Pág. ${currentPageIdx + 1} de ${totalPages}`);
 }
 
-// Hyperlinks internos
+// ── Hyperlinks internos ──
 function processLinksForRender(html) {
   return html.replace(/<a(\s[^>]*)?>/gi, (match, attrs) => {
     if (!attrs) return match;
     const hm = attrs.match(/href="([^"]*)"/i);
     if (!hm) return match;
     const href = hm[1];
-    if (href.startsWith('http') || href.startsWith('mailto:') || href.startsWith('//'))
+    if (href.startsWith('http') || href.startsWith('mailto:') || href.startsWith('//')) {
       return `<a${attrs} target="_blank" rel="noopener noreferrer">`;
+    }
     const parts  = href.split('#');
     const file   = parts[0] ? parts[0].split('/').pop().toLowerCase() : '';
     const anchor = (parts[1] || '').replace(/'/g, "\\'");
@@ -732,17 +1002,23 @@ function processLinksForRender(html) {
 
 function handleInternalLink(anchor, file) {
   let pi = -1;
-  if (anchor && anchorMap[anchor] !== undefined)    pi = anchorMap[anchor];
-  else if (file && fileChapterMap[file] !== undefined) pi = allParagraphs.findIndex(p => p.chapterIndex === fileChapterMap[file]);
+  if (anchor && anchorMap[anchor] !== undefined) {
+    pi = anchorMap[anchor];
+  } else if (file && fileChapterMap[file] !== undefined) {
+    pi = allParagraphs.findIndex(p => p.chapterIndex === fileChapterMap[file]);
+  }
   if (pi >= 0 && paragraphPageMap[pi] !== undefined) goToPage(paragraphPageMap[pi]);
 }
 
-// Sidebar capítulos
+// ── Sidebar de capítulos ──
 function renderChapterSidebar() {
   const section = document.getElementById('chapter-section');
   const list    = document.getElementById('chapter-list');
   list.innerHTML = '';
-  if (!currentBookChapters?.length) { section.classList.remove('visible'); return; }
+  if (!currentBookChapters || !currentBookChapters.length) {
+    section.classList.remove('visible');
+    return;
+  }
   section.classList.add('visible');
   currentBookChapters.forEach((ch, idx) => {
     const div = document.createElement('div');
@@ -754,37 +1030,59 @@ function renderChapterSidebar() {
 }
 
 function updateChapterSidebar() {
-  document.querySelectorAll('.chapter-item').forEach((el, i) => el.classList.toggle('active', i === currentChapterIndex));
-  document.querySelector('.chapter-item.active')?.scrollIntoView({ block: 'nearest' });
+  document.querySelectorAll('.chapter-item').forEach((el, i) =>
+    el.classList.toggle('active', i === currentChapterIndex));
+  const active = document.querySelector('.chapter-item.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  POSICIÓN GUARDADA
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 async function savePosition() {
-  if (!state.currentBookId) return;
-  await savePref(`pos_${state.currentBookId}`, { pageIdx: currentPageIdx, chapterIndex: currentChapterIndex, fontSize: prefs.fontSize });
+  if (!state.currentBookId || !totalPages) return;
+  const anchorParaIdx = getFirstVisibleParaIdx();
+  await savePref(`pos_${state.currentBookId}`, {
+    pageIdx: currentPageIdx,
+    chapterIndex: currentChapterIndex,
+    fontSize: prefs.fontSize,
+    anchorParaIdx: anchorParaIdx
+  });
 }
 
 async function restorePosition() {
   const rec = await dbGet('prefs', `pos_${state.currentBookId}`);
-  if (!rec?.value || !totalPages) { goToPage(0, null, true); return; }
-  goToPage(Math.min(rec.value.pageIdx || 0, totalPages - 1), null, true);
+  if (!rec || !rec.value || !totalPages) { goToPage(0, true); return; }
+  // Preferir anchorParaIdx (sobrevive a cambios de fuente)
+  if (rec.value.anchorParaIdx != null && paragraphPageMap[rec.value.anchorParaIdx] !== undefined) {
+    goToPage(paragraphPageMap[rec.value.anchorParaIdx], true);
+    return;
+  }
+  // Fallback a pageIdx
+  goToPage(Math.min(rec.value.pageIdx || 0, totalPages - 1), true);
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  BOOKMARKS
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 async function addBookmark() {
   if (!state.currentBookId || !totalPages) { setStatus('Primero abrí un libro'); return; }
   const ch      = currentBookChapters[currentChapterIndex];
-  const chapStr = ch?.title ? `${currentChapterIndex + 1}. ${ch.title}` : `Cap. ${currentChapterIndex + 1}`;
+  const chapStr = ch && ch.title
+    ? `${currentChapterIndex + 1}. ${ch.title}`
+    : `Cap. ${currentChapterIndex + 1}`;
   const label   = `${chapStr} · Pág. ${currentPageIdx + 1}`;
-  const anchor  = getFirstVisibleParaIdx(document.getElementById('reader-view'));
+  const anchor  = getFirstVisibleParaIdx();
   const id      = state.nextId++;
-  await dbPut('bookmarks', { id, bookId: state.currentBookId, pageIdx: currentPageIdx, anchorParaIdx: anchor, label, ts: Date.now() });
+  await dbPut('bookmarks', {
+    id, bookId: state.currentBookId,
+    pageIdx: currentPageIdx,
+    anchorParaIdx: anchor != null ? anchor : 0,
+    label,
+    ts: Date.now()
+  });
   await savePref('nextId', state.nextId);
   setStatus('🔖 ' + label);
 }
@@ -793,7 +1091,7 @@ async function renderBookmarks() {
   const section = document.getElementById('bookmarks-section');
   const list    = document.getElementById('bookmarks-list');
   const bms     = await dbGetByIndex('bookmarks', 'bookId', state.currentBookId).catch(() => []);
-  if (!bms?.length) { section.style.display = 'none'; return; }
+  if (!bms || !bms.length) { section.style.display = 'none'; return; }
   section.style.display = 'block';
   list.innerHTML = '';
   bms.sort((a, b) => a.pageIdx - b.pageIdx).forEach(bm => {
@@ -810,21 +1108,28 @@ async function renderBookmarks() {
   list.querySelectorAll('.bookmark-goto').forEach(btn => {
     btn.addEventListener('click', () => {
       showTab('reader');
-      const target = paragraphPageMap[parseInt(btn.dataset.para)] ?? parseInt(btn.dataset.page);
-      goToPage(Math.min(target, totalPages - 1));
+      // Esperar al próximo frame para asegurarse de que el reader-view es visible
+      requestAnimationFrame(() => {
+        const para = parseInt(btn.dataset.para, 10);
+        const target = paragraphPageMap[para] !== undefined
+          ? paragraphPageMap[para]
+          : parseInt(btn.dataset.page, 10);
+        goToPage(Math.min(target, totalPages - 1));
+      });
     });
   });
   list.querySelectorAll('.bookmark-delete').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await dbDelete('bookmarks', parseInt(btn.dataset.id));
-      renderBookmarks(); setStatus('Marcador eliminado');
+      await dbDelete('bookmarks', parseInt(btn.dataset.id, 10));
+      renderBookmarks();
+      setStatus('Marcador eliminado');
     });
   });
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  HIGHLIGHTS
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 function setColor(c) {
   currentColor = c;
@@ -832,8 +1137,8 @@ function setColor(c) {
   document.getElementById('color-' + c).classList.add('active');
 }
 
-document.addEventListener('mouseup', e => { if (!e.target.closest('#sel-toolbar')) handleSel(); });
-document.addEventListener('touchend', e => { if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 120); });
+document.addEventListener('mouseup',   e => { if (!e.target.closest('#sel-toolbar')) handleSel(); });
+document.addEventListener('touchend',  e => { if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 120); });
 document.addEventListener('mousedown', e => { if (!e.target.closest('#sel-toolbar')) hideSel(); });
 
 function handleSel() {
@@ -854,50 +1159,123 @@ async function doHighlight() {
   if (!sel || sel.isCollapsed) return;
   const text = sel.toString().trim();
   if (!text || !state.currentBookId) return;
+
   try {
-    const range = sel.getRangeAt(0), id = state.nextId++;
-    const hl = { id, bookId: state.currentBookId, text, note: '', color: currentColor, ts: Date.now() };
+    const range = sel.getRangeAt(0);
+
+    // Extraer paraIdx del párrafo donde inicia la selección
+    let pNode = range.startContainer;
+    while (pNode && (pNode.nodeType !== 1 || !pNode.hasAttribute || !pNode.hasAttribute('data-para-idx'))) {
+      pNode = pNode.parentNode;
+    }
+    const paraIdx = pNode && pNode.dataset && pNode.dataset.paraIdx !== undefined
+      ? parseInt(pNode.dataset.paraIdx, 10) : null;
+
+    const id = state.nextId++;
+    const hl = {
+      id, bookId: state.currentBookId,
+      text, note: '', color: currentColor, ts: Date.now(),
+      paraIdx: (paraIdx != null && !isNaN(paraIdx)) ? paraIdx : undefined
+    };
+
     wrapRange(range, id, currentColor);
-    state.highlights.push(hl); sel.removeAllRanges();
-    await dbPut('highlights', hl); await savePref('nextId', state.nextId);
-    saveToDrive(); renderSidebar(); setStatus('Subrayado guardado');
-  } catch (e) { setStatus('Seleccioná texto dentro de un mismo párrafo'); }
+    state.highlights.push(hl);
+    sel.removeAllRanges();
+
+    await dbPut('highlights', hl);
+    await savePref('nextId', state.nextId);
+    saveToDrive();
+    renderSidebar();
+    setStatus('Subrayado guardado');
+  } catch (e) {
+    console.error('[doHighlight]', e);
+    setStatus('Seleccioná texto dentro de un mismo párrafo');
+  }
   hideSel();
 }
 
 function wrapRange(range, id, color) {
   const span = document.createElement('span');
-  span.className = `hl hl-${color}`; span.dataset.hlId = id;
-  span.title = 'Clic para ver notas'; span.onclick = () => showTab('highlights');
+  span.className = `hl hl-${color}`;
+  span.dataset.hlId = id;
+  span.title = 'Clic para ver notas';
+  span.onclick = () => showTab('highlights');
   range.surroundContents(span);
 }
 
-// Con CSS columns, todo el contenido está en DOM — aplicar de una sola vez
-function applyHighlightsToPage() {
+/* Aplica todos los highlights del libro al DOM ya renderizado.
+   Estrategia:
+     1. Si el highlight tiene paraIdx → busca dentro de ese párrafo (preciso).
+     2. Si no, fallback: busca el texto en cualquier nodo (compat con highlights viejos). */
+function applyHighlightsToContent() {
   const container = document.getElementById('page-content');
-  const text      = container.textContent;
-  state.highlights.filter(h => h.bookId === state.currentBookId).forEach(hl => {
-    if (!text.includes(hl.text) || container.querySelector(`[data-hl-id="${hl.id}"]`)) return;
-    try {
+  if (!container) return;
+  const bookHls = state.highlights.filter(h => h.bookId === state.currentBookId);
+
+  for (const hl of bookHls) {
+    if (container.querySelector(`[data-hl-id="${hl.id}"]`)) continue;
+    let applied = false;
+
+    // Estrategia 1 — paraIdx (highlights nuevos)
+    if (hl.paraIdx !== undefined && hl.paraIdx !== null) {
+      const paraEl = container.querySelector(`[data-para-idx="${hl.paraIdx}"]`);
+      if (paraEl && paraEl.textContent.includes(hl.text)) {
+        applied = wrapTextInElement(paraEl, hl.text, hl.id, hl.color);
+      }
+    }
+
+    // Estrategia 2 — fallback global (highlights viejos / texto movido)
+    if (!applied) {
       const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
+        if (!node.parentElement || node.parentElement.classList.contains('hl')) continue;
         const idx = node.textContent.indexOf(hl.text);
-        if (idx === -1 || node.parentElement.classList.contains('hl')) continue;
-        const range = document.createRange();
-        range.setStart(node, idx); range.setEnd(node, idx + hl.text.length);
-        wrapRange(range, hl.id, hl.color);
+        if (idx === -1) continue;
+        try {
+          const range = document.createRange();
+          range.setStart(node, idx);
+          range.setEnd(node, idx + hl.text.length);
+          wrapRange(range, hl.id, hl.color);
+          applied = true;
+        } catch (e) {}
         break;
       }
-    } catch (e) {}
-  });
+    }
+  }
+}
+
+function wrapTextInElement(paraEl, text, id, color) {
+  const walker = document.createTreeWalker(paraEl, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (!node.parentElement || node.parentElement.classList.contains('hl')) continue;
+    const idx = node.textContent.indexOf(text);
+    if (idx === -1) continue;
+    try {
+      const range = document.createRange();
+      range.setStart(node, idx);
+      range.setEnd(node, idx + text.length);
+      wrapRange(range, id, color);
+      return true;
+    } catch (e) { return false; }
+  }
+  return false;
 }
 
 async function deleteHighlight(id) {
   state.highlights = state.highlights.filter(h => h.id !== id);
   const span = document.querySelector(`[data-hl-id="${id}"]`);
-  if (span) { const p = span.parentNode; while (span.firstChild) p.insertBefore(span.firstChild, span); p.removeChild(span); }
-  await dbDelete('highlights', id); saveToDrive(); renderHighlights(); renderSidebar(); setStatus('Subrayado eliminado');
+  if (span) {
+    const p = span.parentNode;
+    while (span.firstChild) p.insertBefore(span.firstChild, span);
+    p.removeChild(span);
+  }
+  await dbDelete('highlights', id);
+  saveToDrive();
+  renderHighlights();
+  renderSidebar();
+  setStatus('Subrayado eliminado');
 }
 
 function renderHighlights() {
@@ -909,7 +1287,12 @@ function renderHighlights() {
     return;
   }
   const cs = { yellow:'#ca8a04', blue:'#2563eb', green:'#16a34a', pink:'#db2777' };
-  const cb = { yellow:'rgba(253,224,71,0.30)', blue:'rgba(147,197,253,0.35)', green:'rgba(134,239,172,0.35)', pink:'rgba(249,168,212,0.35)' };
+  const cb = {
+    yellow:'rgba(253,224,71,0.30)',
+    blue:'rgba(147,197,253,0.35)',
+    green:'rgba(134,239,172,0.35)',
+    pink:'rgba(249,168,212,0.35)'
+  };
   bhs.sort((a, b) => a.ts - b.ts).forEach(h => {
     const card = document.createElement('div');
     card.className = 'hl-card';
@@ -928,16 +1311,22 @@ function renderHighlights() {
   });
   list.querySelectorAll('.hl-note').forEach(inp => {
     inp.addEventListener('change', async e => {
-      const h = state.highlights.find(h => h.id === parseInt(e.target.dataset.id));
-      if (h) { h.note = e.target.value; await dbPut('highlights', h); saveToDrive(); setStatus('Nota guardada'); }
+      const h = state.highlights.find(h => h.id === parseInt(e.target.dataset.id, 10));
+      if (h) {
+        h.note = e.target.value;
+        await dbPut('highlights', h);
+        saveToDrive();
+        setStatus('Nota guardada');
+      }
     });
   });
-  list.querySelectorAll('.hl-delete').forEach(btn => btn.addEventListener('click', e => deleteHighlight(parseInt(e.target.dataset.id))));
+  list.querySelectorAll('.hl-delete').forEach(btn =>
+    btn.addEventListener('click', e => deleteHighlight(parseInt(e.target.dataset.id, 10))));
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  BORRAR / LIBERAR LIBRO
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 async function deleteBook(bookId) {
   const book = state.books.find(b => b.id === bookId);
@@ -949,13 +1338,17 @@ async function deleteBook(bookId) {
   state.books      = state.books.filter(b => b.id !== bookId);
   state.highlights = state.highlights.filter(h => h.bookId !== bookId);
   if (state.currentBookId === bookId) {
-    state.currentBookId = null; await savePref('currentBookId', null);
-    clearNavState(); currentBookChapters = [];
-    document.getElementById('page-content').innerHTML = `<div id="empty-reader">Sube un libro para empezar.</div>`;
+    state.currentBookId = null;
+    await savePref('currentBookId', null);
+    clearNavState();
+    mountEmptyBook('Sube un libro para empezar.');
     document.getElementById('book-title-display').textContent = 'Mi Lector';
     document.getElementById('chapter-section').classList.remove('visible');
   }
-  saveToDrive(); renderSidebar(); renderHighlights(); setStatus(`"${book.title}" eliminado`);
+  saveToDrive();
+  renderSidebar();
+  renderHighlights();
+  setStatus(`"${book.title}" eliminado`);
 }
 
 async function freeBookSpace(bookId) {
@@ -965,20 +1358,20 @@ async function freeBookSpace(bookId) {
   if (!full) return;
   await dbPut('books', { ...full, chapters: [], coverBase64: null });
   if (state.currentBookId === bookId) {
-    clearNavState(); currentBookChapters = [];
-    document.getElementById('page-content').innerHTML =
-      `<div id="empty-reader" style="padding-top:60px;">Contenido liberado.<br><br><strong style="color:var(--text)">Volvé a subir el EPUB para leer.</strong></div>`;
+    clearNavState();
+    mountEmptyBook('Contenido liberado.<br><br><strong style="color:var(--text)">Volvé a subir el EPUB para leer.</strong>');
     document.getElementById('chapter-section').classList.remove('visible');
   }
   setStatus('Espacio liberado — subrayados conservados');
 }
 
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 //  BIBLIOTECA
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
 
 async function renderLibrary() {
-  const grid = document.getElementById('library-grid'), empty = document.getElementById('library-empty');
+  const grid  = document.getElementById('library-grid');
+  const empty = document.getElementById('library-empty');
   grid.innerHTML = '';
   if (!state.books.length) { empty.style.display = 'block'; return; }
   empty.style.display = 'none';
@@ -986,17 +1379,17 @@ async function renderLibrary() {
     const hlc    = state.highlights.filter(h => h.bookId === book.id).length;
     const posRec = await dbGet('prefs', `pos_${book.id}`).catch(() => null);
     const full   = await dbGet('books', book.id).catch(() => null);
-    const hasCnt = full?.chapters?.length > 0;
+    const hasCnt = full && full.chapters && full.chapters.length > 0;
     let prog = 'Sin progreso';
-    if (posRec?.value) {
-      const { chapterIndex: ci } = posRec.value;
+    if (posRec && posRec.value) {
+      const ci = posRec.value.chapterIndex || 0;
       const ch = hasCnt && full.chapters[ci];
-      if (ch?.title) prog = `${ci + 1}. ${ch.title}`;
-      else if (hasCnt) prog = `Cap. ${(ci || 0) + 1} de ${full.chapters.length}`;
+      if (ch && ch.title)   prog = `${ci + 1}. ${ch.title}`;
+      else if (hasCnt)      prog = `Cap. ${ci + 1} de ${full.chapters.length}`;
     }
     const card = document.createElement('div');
     card.className = 'book-card';
-    const coverHtml = full?.coverBase64
+    const coverHtml = full && full.coverBase64
       ? `<img src="${full.coverBase64}" alt="${escHtml(book.title)}" loading="lazy">`
       : `<div class="book-cover-initial">${(book.title[0] || '?').toUpperCase()}</div>`;
     card.innerHTML = `
@@ -1017,28 +1410,50 @@ async function renderLibrary() {
   }
 }
 
-// ═══════════════════════════════════════════════════
-//  UI
-// ═══════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  UI — TABS
+// ════════════════════════════════════════════════════════════════
 
 function showTab(tab) {
+  currentTab = tab;
   document.querySelectorAll('.tab').forEach((t, i) =>
     t.classList.toggle('active', ['reader','highlights','library'][i] === tab));
   document.getElementById('reader-view').style.display     = tab === 'reader'     ? 'block' : 'none';
   document.getElementById('highlights-view').style.display = tab === 'highlights' ? 'flex'  : 'none';
   document.getElementById('library-view').style.display    = tab === 'library'    ? 'flex'  : 'none';
+
   if (tab === 'highlights') { renderHighlights(); renderBookmarks(); }
   if (tab === 'library')    renderLibrary();
+  if (tab === 'reader' && allParagraphs.length) {
+    // Si la paginación quedó pendiente porque el viewer estaba oculto, hacerla ahora.
+    // También nos protegemos de cambios de tamaño que ocurrieron mientras el reader
+    // estaba con display:none (el ResizeObserver no dispara en ese caso).
+    requestAnimationFrame(() => {
+      const viewer = document.getElementById('reader-view');
+      const inner  = getViewerInnerSize(viewer);
+      if (needsRepagination || inner.W !== pageWidth || inner.H !== pageHeight) {
+        paginate({ keepAnchor: true });
+      }
+    });
+  }
 }
 
+// Estado inicial de pestañas (sin invocar renderers vacíos)
 document.getElementById('reader-view').style.display     = 'block';
 document.getElementById('highlights-view').style.display = 'none';
 document.getElementById('library-view').style.display    = 'none';
 
+// ════════════════════════════════════════════════════════════════
+//  UI — SIDEBAR / EXPORT / STATUS
+// ════════════════════════════════════════════════════════════════
+
 function renderSidebar() {
   const list = document.getElementById('book-list');
   list.innerHTML = '';
-  if (!state.books.length) { list.innerHTML = '<p style="font-size:12px;color:#555;padding:16px 12px;line-height:1.6;">Sube un epub o txt para empezar</p>'; return; }
+  if (!state.books.length) {
+    list.innerHTML = '<p style="font-size:12px;color:#555;padding:16px 12px;line-height:1.6;">Sube un epub o txt para empezar</p>';
+    return;
+  }
   state.books.forEach(b => {
     const count = state.highlights.filter(h => h.bookId === b.id).length;
     const div   = document.createElement('div');
@@ -1054,15 +1469,21 @@ function renderSidebar() {
 }
 
 function exportTxt() {
-  const bhs = state.highlights.filter(h => h.bookId === state.currentBookId);
+  const bhs  = state.highlights.filter(h => h.bookId === state.currentBookId);
   const book = state.books.find(b => b.id === state.currentBookId);
   if (!bhs.length) { setStatus('No hay subrayados para exportar'); return; }
   let txt = `SUBRAYADOS — ${book ? book.title.toUpperCase() : 'LIBRO'}\n${'═'.repeat(50)}\n\n`;
-  bhs.forEach((h, i) => { txt += `${i + 1}. "${h.text}"\n`; if (h.note) txt += `   → ${h.note}\n`; txt += '\n'; });
+  bhs.forEach((h, i) => {
+    txt += `${i + 1}. "${h.text}"\n`;
+    if (h.note) txt += `   → ${h.note}\n`;
+    txt += '\n';
+  });
   txt += `Exportado el ${new Date().toLocaleDateString('es-ES')}`;
   const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
-  const url  = URL.createObjectURL(blob); const a = document.createElement('a');
-  a.href = url; a.download = 'subrayados.txt'; a.click(); URL.revokeObjectURL(url);
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'subrayados.txt'; a.click();
+  URL.revokeObjectURL(url);
   setStatus('Archivo exportado');
 }
 
@@ -1073,10 +1494,15 @@ function setStatus(msg) {
   statusTimer = setTimeout(updateStatusBar, 2500);
 }
 function setStatusDirect(msg) { document.getElementById('status-text').textContent = msg; }
-function showLoading(msg) { document.getElementById('loading-text').textContent = msg || 'Cargando...'; document.getElementById('loading').style.display = 'flex'; }
-function hideLoading()    { document.getElementById('loading').style.display = 'none'; }
+function showLoading(msg) {
+  document.getElementById('loading-text').textContent = msg || 'Cargando...';
+  document.getElementById('loading').style.display = 'flex';
+}
+function hideLoading() { document.getElementById('loading').style.display = 'none'; }
 
 function escHtml(s) {
   if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }

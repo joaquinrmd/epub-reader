@@ -2,7 +2,7 @@
 <html lang="es" data-theme="day">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="description" content="Lector de EPUB con subrayados y sincronización en Google Drive">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -22,9 +22,6 @@
   <div class="spinner"></div>
   <p id="loading-text">Cargando...</p>
 </div>
-
-<!-- MEASURER — div invisible para calcular alturas de párrafos -->
-<div id="page-measurer" aria-hidden="true"></div>
 
 <!-- SIDEBAR -->
 <div id="sidebar">
@@ -91,12 +88,15 @@
 
     <!-- LECTOR PAGINADO -->
     <div id="reader-view">
-      <div id="page-content">
-        <div id="empty-reader">
-          Sube un epub o txt para empezar a leer.<br><br>
-          Conecta Google Drive para sincronizar tus subrayados.
-        </div>
+      <div id="page-content"></div>
+      <!-- Empty state como overlay aparte (no es hijo del page-content) -->
+      <div id="empty-reader">
+        Sube un epub o txt para empezar a leer.<br><br>
+        Conecta Google Drive para sincronizar tus subrayados.
       </div>
+      <!-- Zonas tappables invisibles para iPad: tocar lados pasa página -->
+      <div id="tap-zone-left"  class="tap-zone" onclick="prevPage()" aria-hidden="true"></div>
+      <div id="tap-zone-right" class="tap-zone" onclick="nextPage()" aria-hidden="true"></div>
     </div>
 
     <!-- SUBRAYADOS -->

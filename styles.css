@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════
-   Mi Lector — styles.css  (v3)
+   Mi Lector — styles.css  (v4 — paginación robusta)
    Temas: day | sepia | night
    ═══════════════════════════════════════════════ */
 
@@ -24,6 +24,11 @@
   --hl-blue:        rgba(147,197,253,0.55);
   --hl-green:       rgba(134,239,172,0.55);
   --hl-pink:        rgba(249,168,212,0.55);
+
+  /* Padding del marco de lectura — el #reader-view es el "marco",
+     el #page-content vive en su zona interior sin padding propio. */
+  --reader-pad-x: 60px;
+  --reader-pad-y: 36px;
 }
 
 /* ─── TEMA DÍA ─── */
@@ -66,32 +71,25 @@
   --hl-pink:   rgba(249,168,212,0.28);
 }
 
-/* ─── LAYOUT ─── */
+/* ─── LAYOUT ROOT ───
+   100dvh para iOS (la barra de URL ya no come pixeles).
+   100vh como fallback en navegadores viejos. */
+html, body {
+  height: 100vh;
+  height: 100dvh;
+}
+
 body {
   font-family: 'DM Sans', sans-serif;
   background: var(--bg);
-  height: 100vh;
   display: flex;
   overflow: hidden;
   font-size: 15px;
   color: var(--text);
+  /* Evita el bounce/scroll lateral del body en iOS */
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
 }
-
-/* ─── MEASURER INVISIBLE ─── */
-#page-measurer {
-  position: fixed;
-  top: -9999px;
-  left: -9999px;
-  visibility: hidden;
-  pointer-events: none;
-  font-family: 'Lora', serif;
-  line-height: 1.95;
-  z-index: -1;
-}
-#page-measurer p  { margin-bottom: 1.4rem; }
-#page-measurer h1 { margin-bottom: 1rem; font-size: 1.35em; margin-top: 0; }
-#page-measurer h2 { margin-bottom: 1rem; font-size: 1.15em; margin-top: 0; }
-#page-measurer h3 { margin-bottom: 1rem; font-size: 1.05em; margin-top: 0; }
 
 /* ─── SIDEBAR ─── */
 #sidebar {
@@ -101,6 +99,9 @@ body {
   flex-direction: column;
   flex-shrink: 0;
   height: 100vh;
+  height: 100dvh;
+  /* En iPad PWA, respetar el safe-area izquierdo */
+  padding-left: env(safe-area-inset-left);
 }
 
 #sidebar-top {
@@ -138,7 +139,7 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 8px;
-  min-height: 0; /* permite que se encoja cuando aparecen capítulos */
+  min-height: 0;
 }
 
 .book-item {
@@ -225,6 +226,7 @@ body {
 /* ─── SIDEBAR BOTTOM ─── */
 #sidebar-bottom {
   padding: 12px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--sidebar-border);
   display: flex;
   flex-direction: column;
@@ -268,6 +270,9 @@ body {
   flex-direction: column;
   overflow: hidden;
   background: var(--surface);
+  min-width: 0;
+  /* En iPad PWA, respetar safe-areas laterales (notch) */
+  padding-right: env(safe-area-inset-right);
 }
 
 /* ─── HEADER ─── */
@@ -279,6 +284,8 @@ body {
   gap: 10px;
   flex-shrink: 0;
   min-height: 52px;
+  /* Respeta safe-area-top en PWA standalone (notch) */
+  padding-top: max(10px, env(safe-area-inset-top));
 }
 #book-title-display {
   font-family: 'Lora', serif;
@@ -405,107 +412,182 @@ body {
   flex: 1;
   display: flex;
   overflow: hidden;
-}
-
-/* ─── READER — MODO PÁGINAS (CSS Columns) ─── */
-#reader-view {
-  flex: 1;
-  overflow: hidden;
-  position: relative;
-  background: var(--reader-bg);
-  transition: background 0.25s;
   min-height: 0;
 }
 
-/* height y column-width se inyectan desde JS después de medir el viewer.
-   column-fill: auto hace que las columnas fluyan HORIZONTALMENTE.
-   padding da el margen visual dentro de cada página. */
-#page-content {
-  position: absolute;
-  top: 0;
-  left: 0;
-  column-fill: auto;
-  column-gap: 0;
-  overflow: visible;
-  padding: 36px 60px;
-  font-size: 17px;
-  will-change: transform;
-  transition: transform 0.18s ease;
-  box-sizing: border-box;
+/* ════════════════════════════════════════════════════════
+   ▼▼▼  READER — MODO PÁGINAS (CSS Columns)  ▼▼▼
+   ════════════════════════════════════════════════════════
+   ARQUITECTURA:
+   - #reader-view es el "marco". Lleva el padding visual.
+     Es position:relative + overflow:hidden.
+   - #page-content vive en la zona INTERIOR del reader-view
+     (top: pad_y, left: pad_x). NO tiene padding propio.
+   - Las dimensiones de #page-content se setean por JS:
+       width  = max-content
+       height = (alto_interior_del_viewer)
+       column-width = (ancho_interior_del_viewer)
+   - Navegación: translate3d(-pageIdx * W_interior, 0, 0)
+   ════════════════════════════════════════════════════════ */
+
+#reader-view {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--reader-bg);
+  transition: background 0.25s;
+  min-height: 0;
+  min-width: 0;
+  padding: var(--reader-pad-y) var(--reader-pad-x);
+  /* iPad PWA: si hay safe-area-inset-bottom, se suma al padding inferior */
+  padding-bottom: max(var(--reader-pad-y), env(safe-area-inset-bottom));
+  /* Bloquea cualquier scroll/zoom nativo dentro del reader */
+  touch-action: none;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
-/* Tipografía del lector */
+#page-content {
+  position: absolute;
+  /* Posición exacta dentro del padding-box del reader-view */
+  top: var(--reader-pad-y);
+  left: var(--reader-pad-x);
+  /* width, height y column-width los setea JS al medir el viewer */
+  width: max-content;
+  /* CSS multi-column: las columnas fluyen HORIZONTALMENTE
+     (column-fill:auto + height fija = una columna por "página") */
+  column-fill: auto;
+  column-gap: 0;
+  /* GPU acceleration */
+  will-change: transform;
+  transition: transform 0.18s ease;
+  -webkit-transform: translate3d(0, 0, 0);
+          transform: translate3d(0, 0, 0);
+  /* Tipografía base — los hijos heredan */
+  font-size: 17px;
+  font-family: 'Lora', serif;
+  color: var(--text);
+}
+
+/* Tipografía del lector — TODOS los selectores deben caer dentro
+   de #page-content para que NO afecten la pestaña Subrayados o Biblioteca. */
 #page-content p {
   font-family: 'Lora', serif;
   font-size: inherit;
-  line-height: 1.95;
+  line-height: 1.85;
   color: var(--text);
-  margin-bottom: 1.4rem;
-  transition: color 0.25s;
+  margin-bottom: 1.2rem;
+  text-align: justify;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+  /* Evita que un párrafo solitario se parta dejando viuda/huérfana */
+  orphans: 2;
+  widows: 2;
 }
-#page-content h1, #page-content h2, #page-content h3 {
+#page-content h1, #page-content h2, #page-content h3, #page-content h4 {
   font-family: 'Lora', serif;
   color: var(--text);
-  line-height: 1.4;
-  margin-bottom: 1rem;
+  line-height: 1.3;
+  margin-bottom: 0.9rem;
+  margin-top: 0.4rem;
+  /* Encabezados nunca parten entre columnas */
+  break-inside: avoid;
+  -webkit-column-break-inside: avoid;
+  page-break-inside: avoid;
 }
-#page-content h1 { font-size: 1.35em; margin-top: 0.5rem; }
-#page-content h2 { font-size: 1.15em; }
-#page-content h3 { font-size: 1.05em; }
+#page-content h1 { font-size: 1.45em; font-weight: 500; }
+#page-content h2 { font-size: 1.20em; font-weight: 500; }
+#page-content h3 { font-size: 1.05em; font-weight: 500; }
+#page-content h4 { font-size: 1.00em; font-weight: 500; font-style: italic; }
 #page-content blockquote {
   border-left: 3px solid var(--border);
   padding-left: 1rem;
   color: var(--text-light);
-  margin-bottom: 1.4rem;
+  margin: 0 0 1.2rem 0.5rem;
   font-style: italic;
   font-family: 'Lora', serif;
   font-size: inherit;
 }
+#page-content ul, #page-content ol {
+  margin: 0 0 1.2rem 1.5rem;
+  font-family: 'Lora', serif;
+  font-size: inherit;
+  line-height: 1.85;
+}
+#page-content li { margin-bottom: 0.4rem; }
 #page-content a {
   color: var(--accent);
   text-decoration: none;
   cursor: pointer;
 }
 #page-content a:hover { text-decoration: underline; }
+#page-content em, #page-content i { font-style: italic; }
+#page-content strong, #page-content b { font-weight: 500; }
 
-/* Encabezado de capítulo dentro de la página */
+/* Encabezado de capítulo dentro del contenido — abre página nueva */
 .chapter-header-inline {
   font-family: 'DM Sans', sans-serif;
-  font-size: 0.75em;
+  font-size: 0.78em;
   font-weight: 500;
   color: var(--muted);
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  margin-bottom: 2rem;
-  padding-bottom: 0.8rem;
+  margin: 0 0 1.5rem 0;
+  padding-bottom: 0.6rem;
   border-bottom: 1px solid var(--border);
+  /* Cada capítulo ABRE en columna (página) nueva */
+  break-before: column;
+  -webkit-column-break-before: always;
+  page-break-before: always;
+  break-inside: avoid;
 }
 
-/* Pantalla vacía */
+/* Empty state — overlay aparte, no es hijo del page-content */
 #empty-reader {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
   font-family: 'DM Sans', sans-serif;
   font-size: 15px;
   color: var(--muted);
   text-align: center;
-  padding: 80px 20px;
+  padding: 40px 20px;
   line-height: 1.7;
+  pointer-events: none;
+  /* Visible por defecto, se oculta cuando hay libro */
 }
+#reader-view.has-book #empty-reader { display: none; }
 
-/* Animación de cambio de página */
-@keyframes slideNext {
-  from { opacity: 0; transform: translateX(24px); }
-  to   { opacity: 1; transform: translateX(0); }
+/* Zonas tappables invisibles (iPad) — solo activas con libro abierto */
+.tap-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 18%;
+  z-index: 5;
+  cursor: pointer;
+  display: none;
+  background: transparent;
+  -webkit-tap-highlight-color: transparent;
 }
-@keyframes slidePrev {
-  from { opacity: 0; transform: translateX(-24px); }
-  to   { opacity: 1; transform: translateX(0); }
-}
-.anim-next { animation: slideNext 0.18s ease; }
-.anim-prev { animation: slidePrev 0.18s ease; }
+#reader-view.has-book .tap-zone { display: block; }
+#tap-zone-left  { left: 0; }
+#tap-zone-right { right: 0; }
 
 /* ─── HIGHLIGHTS ─── */
-.hl { border-radius: 3px; padding: 1px 2px; cursor: pointer; transition: filter 0.15s; }
-.hl:hover      { filter: brightness(0.88); }
+.hl {
+  border-radius: 3px;
+  padding: 1px 2px;
+  cursor: pointer;
+  transition: filter 0.15s;
+  /* No partir highlights entre columnas */
+  -webkit-box-decoration-break: clone;
+          box-decoration-break: clone;
+}
+.hl:hover  { filter: brightness(0.88); }
 .hl-yellow { background: var(--hl-yellow); }
 .hl-blue   { background: var(--hl-blue); }
 .hl-green  { background: var(--hl-green); }
@@ -733,6 +815,7 @@ body {
   overflow: hidden;
   flex-shrink: 0;
   cursor: pointer;
+  position: relative;
 }
 [data-theme="night"] .book-cover { background: #2d2219; }
 [data-theme="sepia"] .book-cover { background: #e8d8b8; }
@@ -760,7 +843,6 @@ body {
   padding: 2px 5px;
   border-radius: 3px;
 }
-.book-cover { position: relative; }
 
 .book-card-info {
   padding: 10px 12px 4px;
@@ -810,12 +892,12 @@ body {
   text-align: center;
   white-space: nowrap;
 }
-.btn-card-open:hover   { border-color: var(--accent); color: var(--accent); }
-.btn-card-free         { color: var(--accent); border-color: var(--accent); }
-.btn-card-free:hover   { background: var(--accent); color: #fff; }
+.btn-card-open:hover    { border-color: var(--accent); color: var(--accent); }
+.btn-card-free          { color: var(--accent); border-color: var(--accent); }
+.btn-card-free:hover    { background: var(--accent); color: #fff; }
 .btn-card-free:disabled { opacity: 0.35; cursor: default; }
-.btn-card-delete       { color: #dc2626; border-color: #fca5a5; }
-.btn-card-delete:hover { background: #fee2e2; }
+.btn-card-delete        { color: #dc2626; border-color: #fca5a5; }
+.btn-card-delete:hover  { background: #fee2e2; }
 
 /* ─── STATUS BAR ─── */
 #status-bar {
@@ -825,10 +907,13 @@ body {
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  /* iPad PWA: respeta el inset inferior (home indicator) */
+  padding-bottom: max(7px, env(safe-area-inset-bottom));
+  background: var(--surface);
 }
 .btn-nav {
   font-size: 15px;
-  padding: 3px 10px;
+  padding: 4px 12px;
   border-radius: 5px;
   border: 1px solid var(--border);
   background: var(--bg);
@@ -884,6 +969,7 @@ body {
   flex-direction: column;
   gap: 12px;
   backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
 }
 [data-theme="night"] #loading { background: rgba(26,26,26,0.92); }
 [data-theme="sepia"] #loading { background: rgba(244,236,216,0.92); }
@@ -897,25 +983,35 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ─── FIX FLEX OVERFLOW ───
-   Sin min-height:0 los flex-children no se encogen
-   y el contenido rompe el layout de 100vh          */
-#main, #content, #reader-view, #page-content {
-  min-height: 0;
-}
-
 /* ─── SCROLLBARS ─── */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
 
-/* ─── RESPONSIVE ─── */
-@media (max-width: 640px) {
+/* ─── RESPONSIVE — IPAD/MOBILE ─── */
+/* iPad portrait: reduce el padding lateral del lector */
+@media (max-width: 1024px) {
+  :root {
+    --reader-pad-x: 44px;
+    --reader-pad-y: 30px;
+  }
+}
+
+@media (max-width: 760px) {
+  :root {
+    --reader-pad-x: 28px;
+    --reader-pad-y: 24px;
+  }
   #sidebar { width: 200px; }
-  #page-content { padding: 24px 20px; }
   #book-title-display { display: none; }
   #font-controls { display: none; }
+  .tap-zone { width: 22%; }
 }
+
 @media (max-width: 480px) {
+  :root {
+    --reader-pad-x: 20px;
+    --reader-pad-y: 20px;
+  }
   #sidebar { display: none; }
 }
