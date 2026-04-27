@@ -654,7 +654,9 @@ async function calculatePages(anchorParaIdx = null) {
   const pageContent = document.getElementById('page-content');
   const rect        = pageContent.getBoundingClientRect();
   const innerWidth  = Math.max(rect.width - 120, 180);   // menos padding
-  const pageHeight  = Math.max(rect.height - 72, 200);   // menos padding
+  // rect.height ya excluye la barra de estado (es sibling, no hijo)
+  // Solo restar padding top(36) + bottom(52) + margen de seguridad(16)
+  const pageHeight  = Math.max(rect.height - 104, 200);
 
   measurer.style.width    = innerWidth + 'px';
   measurer.style.fontSize = prefs.fontSize + 'px';
