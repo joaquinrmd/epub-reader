@@ -870,8 +870,20 @@ function setupNavigation() {
     if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp'    || e.key === 'PageUp')   prevPage();
   });
 
-  // Swipe (iPad y touch)
+  // Rueda del mouse → cambiar página (en vez de scrollear)
   const readerView = document.getElementById('reader-view');
+  readerView.addEventListener('wheel', e => {
+    e.preventDefault();
+    if (e.deltaY > 0) nextPage();
+    else if (e.deltaY < 0) prevPage();
+  }, { passive: false });
+
+  // Touch — prevenir scroll nativo dentro del lector
+  readerView.addEventListener('touchmove', e => {
+    e.preventDefault();
+  }, { passive: false });
+
+  // Swipe (iPad y touch)
   let tx = 0, ty = 0;
   readerView.addEventListener('touchstart', e => {
     tx = e.touches[0].clientX;

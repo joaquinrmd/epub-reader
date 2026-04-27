@@ -892,6 +892,13 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ─── FIX FLEX OVERFLOW ───
+   Sin min-height:0 los flex-children no se encogen
+   y el contenido rompe el layout de 100vh          */
+#main, #content, #reader-view, #page-content {
+  min-height: 0;
+}
+
 /* ─── SCROLLBARS ─── */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
