@@ -687,6 +687,7 @@ function collectIds(el) {
 async function paginate(opts) {
   opts = opts || {};
   const viewer    = document.getElementById('reader-view');
+  const clip      = document.getElementById('page-clip');
   const container = document.getElementById('page-content');
 
   if (!allParagraphs.length || !currentBookChapters.length) {
@@ -709,7 +710,7 @@ async function paginate(opts) {
     try { await document.fonts.ready; } catch (e) {}
   }
 
-  // 3. Reset transform y transición ANTES de medir (las medidas asumen translateX(0))
+  // 3. Reset transform y transición ANTES de medir
   container.style.transition = 'none';
   container.style.transform  = 'translate3d(0,0,0)';
 
@@ -723,11 +724,15 @@ async function paginate(opts) {
   pageWidth  = inner.W;
   pageHeight = inner.H;
 
-  // 6. Aplicar dimensiones EXACTAS al page-content
+  // 6. Aplicar dimensiones EXACTAS al CLIP (la "ventana" de una página)
+  //    y al CONTENT (column-width = mismo ancho que el clip)
+  clip.style.width        = inner.W + 'px';
+  clip.style.height       = inner.H + 'px';
+  clip.style.right        = 'auto';   // override del CSS por defecto
+  clip.style.bottom       = 'auto';
   container.style.fontSize    = prefs.fontSize + 'px';
-  container.style.height      = inner.H + 'px';
   container.style.columnWidth = inner.W + 'px';
-  container.style.width       = 'max-content';
+  // height/width del container vienen del CSS (100%/100%)
 
   // 7. Renderizar HTML del libro (si no se hizo ya, o si cambió de libro)
   const bookKey = String(state.currentBookId);
@@ -740,20 +745,24 @@ async function paginate(opts) {
   // 8. Esperar reflow tras inyectar HTML/cambiar dimensiones
   await waitForLayout();
 
-  // 9. Calcular total de páginas — usar scrollWidth + epsilon para evitar redondeos
+  // 9. Calcular total de páginas — el container ahora es width:100% pero el
+  //    contenido en column layout se extiende horizontalmente; usamos
+  //    scrollWidth que reporta el ancho TOTAL del column flow.
   totalPages = Math.max(1, Math.ceil((container.scrollWidth - 1) / pageWidth));
 
-  // 10. Construir mapas paragraph→page y chapter→page
-  buildParagraphPageMap(container);
+  // 10. Construir mapas paragraph→page y chapter→page (solo headers chapter
+  //     son baratos; paragraphPageMap se construye lazy si hace falta)
   buildChapterPageMap(container);
+  paragraphPageMapBuilt = false;
 
   // 11. Aplicar highlights guardados
   applyHighlightsToContent();
 
   // 12. Decidir página destino
   let target = currentPageIdx;
-  if (anchorIdx != null && paragraphPageMap[anchorIdx] !== undefined) {
-    target = paragraphPageMap[anchorIdx];
+  if (anchorIdx != null) {
+    const tp = paragraphToPage(anchorIdx, container);
+    if (tp != null) target = tp;
   } else {
     target = Math.min(currentPageIdx, totalPages - 1);
   }
@@ -797,18 +806,44 @@ function renderBookHTML(container) {
   container.innerHTML = html;
 }
 
+/* paragraphPageMap se construye PEREZOSAMENTE: solo cuando alguien
+   pregunta "en qué página está el párrafo X" (bookmarks goto, links
+   internos, restorePosition, repaginación tras cambio de fuente).
+   Esto ahorra ~10000 reads de getBoundingClientRect en libros largos. */
+let paragraphPageMapBuilt = false;
+
 function buildParagraphPageMap(container) {
   paragraphPageMap = {};
-  // El container está en translate(0) — sus rects son absolutas pero coherentes.
-  const containerRect = container.getBoundingClientRect();
+  if (!container) container = document.getElementById('page-content');
   const W = pageWidth;
   if (W <= 0) return;
+  // offsetLeft es relativo al offsetParent. Como el container tiene
+  // contain:layout, suele ser su propio offsetParent — pero por seguridad
+  // usamos el rect del container como referencia.
+  const containerRect = container.getBoundingClientRect();
   container.querySelectorAll('[data-para-idx]').forEach(el => {
     const idx = parseInt(el.dataset.paraIdx, 10);
     const rect = el.getBoundingClientRect();
     const offsetX = rect.left - containerRect.left;
     paragraphPageMap[idx] = Math.max(0, Math.floor(offsetX / W));
   });
+  paragraphPageMapBuilt = true;
+}
+
+/* Versión barata: solo busca un párrafo específico en lugar de
+   construir el mapa completo. Si el mapa ya está construido lo usa. */
+function paragraphToPage(paraIdx, container) {
+  if (paragraphPageMapBuilt) return paragraphPageMap[paraIdx];
+  if (!container) container = document.getElementById('page-content');
+  const el = container.querySelector(`[data-para-idx="${paraIdx}"]`);
+  if (!el || pageWidth <= 0) return null;
+  const containerRect = container.getBoundingClientRect();
+  const rect = el.getBoundingClientRect();
+  const offsetX = rect.left - containerRect.left;
+  // Si el container tiene transform aplicado, eso afecta su rect — pero
+  // como el rect del child también está afectado por el mismo transform,
+  // la diferencia (offsetX) es invariante. ✓
+  return Math.max(0, Math.floor(offsetX / pageWidth));
 }
 
 function buildChapterPageMap(container) {
@@ -826,22 +861,33 @@ function buildChapterPageMap(container) {
   });
 }
 
+/* Devuelve el paraIdx del primer párrafo visible en la página actual.
+   Usa elementFromPoint = O(1) en lugar de iterar todos los párrafos. */
 function getFirstVisibleParaIdx() {
-  const viewer    = document.getElementById('reader-view');
-  const container = document.getElementById('page-content');
-  if (!viewer || !container) return null;
-  const cs = getComputedStyle(viewer);
-  const padLeft = parseFloat(cs.paddingLeft) || 0;
-  const padRight = parseFloat(cs.paddingRight) || 0;
-  const vr = viewer.getBoundingClientRect();
-  const innerLeft  = vr.left + padLeft;
-  const innerRight = vr.right - padRight;
-  const els = container.querySelectorAll('[data-para-idx]');
-  for (const el of els) {
-    const r = el.getBoundingClientRect();
-    if (r.right > innerLeft + 4 && r.left < innerRight - 4) {
+  const clip = document.getElementById('page-clip');
+  if (!clip) return null;
+  const r = clip.getBoundingClientRect();
+  if (r.width < 5 || r.height < 5) return null;
+  // Punto un poco hacia adentro del borde superior izquierdo del clip.
+  // Suficiente para caer dentro del primer párrafo visible.
+  const x = r.left + 8;
+  const y = r.top + 8;
+  let el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  // Subir hasta encontrar un elemento con data-para-idx
+  while (el && el !== document.body) {
+    if (el.dataset && el.dataset.paraIdx !== undefined) {
       return parseInt(el.dataset.paraIdx, 10);
     }
+    el = el.parentElement;
+  }
+  // Fallback: probar un punto un poco más adentro (por si hay margins)
+  el = document.elementFromPoint(r.left + r.width / 2, r.top + 20);
+  while (el && el !== document.body) {
+    if (el.dataset && el.dataset.paraIdx !== undefined) {
+      return parseInt(el.dataset.paraIdx, 10);
+    }
+    el = el.parentElement;
   }
   return null;
 }
@@ -1007,7 +1053,10 @@ function handleInternalLink(anchor, file) {
   } else if (file && fileChapterMap[file] !== undefined) {
     pi = allParagraphs.findIndex(p => p.chapterIndex === fileChapterMap[file]);
   }
-  if (pi >= 0 && paragraphPageMap[pi] !== undefined) goToPage(paragraphPageMap[pi]);
+  if (pi >= 0) {
+    const tp = paragraphToPage(pi);
+    if (tp != null) goToPage(tp);
+  }
 }
 
 // ── Sidebar de capítulos ──
@@ -1055,9 +1104,9 @@ async function restorePosition() {
   const rec = await dbGet('prefs', `pos_${state.currentBookId}`);
   if (!rec || !rec.value || !totalPages) { goToPage(0, true); return; }
   // Preferir anchorParaIdx (sobrevive a cambios de fuente)
-  if (rec.value.anchorParaIdx != null && paragraphPageMap[rec.value.anchorParaIdx] !== undefined) {
-    goToPage(paragraphPageMap[rec.value.anchorParaIdx], true);
-    return;
+  if (rec.value.anchorParaIdx != null) {
+    const tp = paragraphToPage(rec.value.anchorParaIdx);
+    if (tp != null) { goToPage(tp, true); return; }
   }
   // Fallback a pageIdx
   goToPage(Math.min(rec.value.pageIdx || 0, totalPages - 1), true);
@@ -1111,9 +1160,8 @@ async function renderBookmarks() {
       // Esperar al próximo frame para asegurarse de que el reader-view es visible
       requestAnimationFrame(() => {
         const para = parseInt(btn.dataset.para, 10);
-        const target = paragraphPageMap[para] !== undefined
-          ? paragraphPageMap[para]
-          : parseInt(btn.dataset.page, 10);
+        let target = paragraphToPage(para);
+        if (target == null) target = parseInt(btn.dataset.page, 10);
         goToPage(Math.min(target, totalPages - 1));
       });
     });
@@ -1137,9 +1185,61 @@ function setColor(c) {
   document.getElementById('color-' + c).classList.add('active');
 }
 
-document.addEventListener('mouseup',   e => { if (!e.target.closest('#sel-toolbar')) handleSel(); });
-document.addEventListener('touchend',  e => { if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 120); });
-document.addEventListener('mousedown', e => { if (!e.target.closest('#sel-toolbar')) hideSel(); });
+/* Encuentra el ancestro con data-para-idx (un párrafo) — null si no hay. */
+function findParaAncestor(node) {
+  if (!node) return null;
+  let cur = node.nodeType === 1 ? node : node.parentElement;
+  while (cur && cur !== document.body) {
+    if (cur.dataset && cur.dataset.paraIdx !== undefined) return cur;
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+/* Si la selección actual cruza párrafos (por arrastre fuera de la página
+   visible — todo el libro está en el DOM), recortarla al final del primer
+   párrafo seleccionado. Esto evita el caso "seleccioné todo el libro". */
+function clampSelectionToOnePara() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+  const range = sel.getRangeAt(0);
+
+  const pageContent = document.getElementById('page-content');
+  if (!pageContent || !pageContent.contains(range.commonAncestorContainer)) return;
+
+  const startPara = findParaAncestor(range.startContainer);
+  const endPara   = findParaAncestor(range.endContainer);
+
+  if (!startPara || !endPara) return;
+  if (startPara === endPara) return;  // selección en un solo párrafo, todo bien
+
+  // Cruza párrafos — truncar al final del startPara
+  const newRange = document.createRange();
+  newRange.setStart(range.startContainer, range.startOffset);
+  // Buscar el último nodo de texto del startPara
+  const walker = document.createTreeWalker(startPara, NodeFilter.SHOW_TEXT);
+  let lastText = null, n;
+  while ((n = walker.nextNode())) lastText = n;
+  if (lastText) {
+    newRange.setEnd(lastText, lastText.textContent.length);
+    sel.removeAllRanges();
+    sel.addRange(newRange);
+  }
+}
+
+document.addEventListener('mouseup', e => {
+  if (e.target.closest('#sel-toolbar')) return;
+  // Truncar primero, luego mostrar toolbar con la selección final
+  clampSelectionToOnePara();
+  handleSel();
+});
+document.addEventListener('touchend', e => {
+  if (e.target.closest('#sel-toolbar')) return;
+  setTimeout(() => { clampSelectionToOnePara(); handleSel(); }, 120);
+});
+document.addEventListener('mousedown', e => {
+  if (!e.target.closest('#sel-toolbar')) hideSel();
+});
 
 function handleSel() {
   const sel = window.getSelection();

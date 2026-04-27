@@ -88,7 +88,11 @@
 
     <!-- LECTOR PAGINADO -->
     <div id="reader-view">
-      <div id="page-content"></div>
+      <!-- #page-clip = ventana de UNA página (overflow:hidden propio).
+           Sus dimensiones exactas las setea JS al ancho/alto interior del viewer. -->
+      <div id="page-clip">
+        <div id="page-content"></div>
+      </div>
       <!-- Empty state como overlay aparte (no es hijo del page-content) -->
       <div id="empty-reader">
         Sube un epub o txt para empezar a leer.<br><br>

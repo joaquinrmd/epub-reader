@@ -416,18 +416,28 @@ body {
 }
 
 /* ════════════════════════════════════════════════════════
-   ▼▼▼  READER — MODO PÁGINAS (CSS Columns)  ▼▼▼
+   ▼▼▼  READER — MODO PÁGINAS (CSS Columns + clip wrapper) ▼▼▼
    ════════════════════════════════════════════════════════
-   ARQUITECTURA:
-   - #reader-view es el "marco". Lleva el padding visual.
-     Es position:relative + overflow:hidden.
-   - #page-content vive en la zona INTERIOR del reader-view
-     (top: pad_y, left: pad_x). NO tiene padding propio.
-   - Las dimensiones de #page-content se setean por JS:
-       width  = max-content
-       height = (alto_interior_del_viewer)
-       column-width = (ancho_interior_del_viewer)
-   - Navegación: translate3d(-pageIdx * W_interior, 0, 0)
+   ARQUITECTURA v5 (corregida):
+   - #reader-view es el "marco" exterior. Lleva el padding visual
+     (margen blanco alrededor del texto). overflow:hidden de seguro.
+   - #page-clip es la VENTANA de exactamente UNA página.
+     Sus dimensiones exactas las setea JS:
+       top:    pad_y
+       left:   pad_x
+       width:  ancho interior del viewer
+       height: alto interior del viewer
+     overflow:hidden propio → recorta cualquier columna asomando.
+   - #page-content vive DENTRO del clip:
+       width:        max-content  (sumatoria de todas las columnas)
+       height:       100%         (=alto del clip = una página)
+       column-width: ancho del clip
+       column-fill:  auto          (fluye horizontal)
+   - Navegar = translate3d(-pageIdx * pageWidth, 0, 0) en page-content.
+     Como el clip recorta exactamente al ancho de una página, NUNCA
+     se asoma una columna vecina. (En v4 el bug era que el padding
+     del reader-view dejaba ver los primeros pad_x px de la columna
+     siguiente.)
    ════════════════════════════════════════════════════════ */
 
 #reader-view {
@@ -447,15 +457,28 @@ body {
   -webkit-user-select: text;
 }
 
-#page-content {
+#page-clip {
   position: absolute;
-  /* Posición exacta dentro del padding-box del reader-view */
-  top: var(--reader-pad-y);
-  left: var(--reader-pad-x);
-  /* width, height y column-width los setea JS al medir el viewer */
+  /* top, left, width, height los setea JS al medir el padding-box
+     interior del viewer. Si JS aún no corrió, fallback a inset:0 con
+     el padding del padre (el browser lo respeta vía caja interior). */
+  top:    var(--reader-pad-y);
+  left:   var(--reader-pad-x);
+  right:  var(--reader-pad-x);
+  bottom: var(--reader-pad-y);
+  overflow: hidden;
+  /* Ayuda al browser a optimizar repintados al hacer translate */
+  contain: layout style paint;
+}
+
+#page-content {
+  /* width:max-content + column-width:W = el browser crea una columna por
+     "página" y EXTIENDE el contenido horizontalmente todo lo necesario.
+     Si pusiéramos width:100% (= W del clip), solo se crearía 1 columna
+     y el contenido se truncaría — el famoso bug. */
   width: max-content;
-  /* CSS multi-column: las columnas fluyen HORIZONTALMENTE
-     (column-fill:auto + height fija = una columna por "página") */
+  height: 100%;
+  /* column-width lo setea JS al ancho exacto del clip */
   column-fill: auto;
   column-gap: 0;
   /* GPU acceleration */
@@ -467,6 +490,8 @@ body {
   font-size: 17px;
   font-family: 'Lora', serif;
   color: var(--text);
+  /* contain — el contenido es independiente del exterior */
+  contain: layout style;
 }
 
 /* Tipografía del lector — TODOS los selectores deben caer dentro
