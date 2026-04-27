@@ -407,26 +407,30 @@ body {
   overflow: hidden;
 }
 
-/* ─── READER — MODO PÁGINAS ─── */
+/* ─── READER — MODO PÁGINAS (CSS Columns) ─── */
 #reader-view {
   flex: 1;
   overflow: hidden;
   position: relative;
-  display: flex;
-  flex-direction: column;
   background: var(--reader-bg);
   transition: background 0.25s;
+  min-height: 0;
 }
 
+/* El contenido del libro usa CSS columns para paginar.
+   El browser calcula los saltos — sin errores de medición manual.
+   La navegación se hace con transform translateX. */
 #page-content {
-  flex: 1;
-  overflow: hidden;
-  padding: 36px 60px;
-  max-width: 740px;
-  margin: 0 auto;
-  width: 100%;
-  font-size: 17px; /* controlado por JS */
-  position: relative;
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  column-count: 1;
+  column-fill: auto;
+  column-gap: 0;
+  padding: 36px 60px 48px;
+  font-size: 17px;
+  will-change: transform;
+  transition: transform 0.18s ease;
+  /* Sin max-width — el ancho del viewer es el ancho de la columna */
 }
 
 /* Tipografía del lector */
