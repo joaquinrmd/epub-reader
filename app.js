@@ -661,9 +661,11 @@ async function calculatePages(anchorParaIdx = null) {
   const pageContent = document.getElementById('page-content');
   const rect        = pageContent.getBoundingClientRect();
   const innerWidth  = Math.max(rect.width - 120, 180);
-  // rect.height ya excluye la barra de estado
-  // Restar padding top(36) + bottom(52) + margen de seguridad amplio(48)
-  const pageHeight  = Math.max(rect.height - 136, 200);
+  // El margen de seguridad crece con el tamaño de fuente —
+  // a mayor fuente, mayor es el error acumulado de medición
+  const lineH        = prefs.fontSize * 1.95;           // altura real de una línea
+  const safetyMargin = Math.ceil(lineH * 1.8);          // ~1.8 líneas de buffer
+  const pageHeight   = Math.max(rect.height - 88 - safetyMargin, 200);
 
   measurer.style.width    = innerWidth + 'px';
   measurer.style.fontSize = prefs.fontSize + 'px';
