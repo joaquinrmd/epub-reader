@@ -173,7 +173,6 @@ async function changeFontSize(delta) {
   const viewer    = document.getElementById('reader-view');
   const anchorIdx = getFirstVisibleParaIdx(viewer);
 
-  // Aplicar nuevo tamaño — CSS columns se ajusta automáticamente
   container.style.fontSize   = prefs.fontSize + 'px';
   container.style.transition = 'none';
   container.style.transform  = 'translateX(0)';
@@ -182,9 +181,17 @@ async function changeFontSize(delta) {
 
   if (!allParagraphs.length) return;
 
+  // Re-setear dimensiones con la nueva fuente
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  totalPages = computeTotalPages(container, viewer);
+  const W = viewer.clientWidth;
+  const H = viewer.clientHeight;
+  container.style.height      = H + 'px';
+  container.style.columnWidth = W + 'px';
+
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  totalPages = Math.max(1, Math.round(container.scrollWidth / W));
   buildParagraphPageMap(viewer);
   buildChapterPageMap(viewer);
 
@@ -551,10 +558,24 @@ async function layoutBook() {
   const container = document.getElementById('page-content');
   const viewer    = document.getElementById('reader-view');
 
-  container.style.transition = 'none';
-  container.style.transform  = 'translateX(0)';
-  container.style.fontSize   = prefs.fontSize + 'px';
+  // Reset transform y transición
+  container.style.transition  = 'none';
+  container.style.transform   = 'translateX(0)';
+  container.style.fontSize    = prefs.fontSize + 'px';
   currentPageIdx = 0;
+
+  // Esperar fonts antes de medir
+  if (document.fonts?.ready) await document.fonts.ready;
+  await new Promise(r => requestAnimationFrame(r));
+
+  // ── CLAVE: setear height y column-width al tamaño EXACTO del viewer ──
+  // Esto hace que CSS columns fluya horizontalmente en vez de verticalmente
+  const W = viewer.clientWidth;
+  const H = viewer.clientHeight;
+  container.style.height      = H + 'px';
+  container.style.columnWidth = W + 'px';
+  // El strip puede ser tan ancho como necesite — el viewer oculta el resto
+  container.style.width       = 'max-content';
 
   // Construir HTML completo con data-para-idx y encabezados de capítulo
   let html = '', lastCi = -1;
@@ -575,11 +596,10 @@ async function layoutBook() {
 
   container.innerHTML = html;
 
-  // Esperar fonts y doble reflow para que CSS columns se calcule correctamente
-  if (document.fonts?.ready) await document.fonts.ready;
+  // Segundo reflow para que el browser calcule el scrollWidth correcto
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  totalPages = computeTotalPages(container, viewer);
+  totalPages = Math.max(1, Math.round(container.scrollWidth / W));
   buildParagraphPageMap(viewer);
   buildChapterPageMap(viewer);
   applyHighlightsToPage();

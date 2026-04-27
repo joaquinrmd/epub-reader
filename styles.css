@@ -417,20 +417,21 @@ body {
   min-height: 0;
 }
 
-/* El contenido del libro usa CSS columns para paginar.
-   El browser calcula los saltos — sin errores de medición manual.
-   La navegación se hace con transform translateX. */
+/* height y column-width se inyectan desde JS después de medir el viewer.
+   column-fill: auto hace que las columnas fluyan HORIZONTALMENTE.
+   padding da el margen visual dentro de cada página. */
 #page-content {
   position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  column-count: 1;
+  top: 0;
+  left: 0;
   column-fill: auto;
   column-gap: 0;
-  padding: 36px 60px 48px;
+  overflow: visible;
+  padding: 36px 60px;
   font-size: 17px;
   will-change: transform;
   transition: transform 0.18s ease;
-  /* Sin max-width — el ancho del viewer es el ancho de la columna */
+  box-sizing: border-box;
 }
 
 /* Tipografía del lector */
