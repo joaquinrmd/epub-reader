@@ -8,129 +8,141 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Mi Lector">
   <meta name="theme-color" content="#1c1c1c">
-
   <title>Mi Lector</title>
 
   <link rel="stylesheet" href="styles.css">
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icons/icon-192.svg">
-
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
 </head>
 <body>
 
-  <!-- ════ LOADING OVERLAY ════ -->
-  <div id="loading">
-    <div class="spinner"></div>
-    <p id="loading-text">Cargando...</p>
-  </div>
+<!-- LOADING -->
+<div id="loading">
+  <div class="spinner"></div>
+  <p id="loading-text">Cargando...</p>
+</div>
 
-  <!-- ════ SIDEBAR ════ -->
-  <div id="sidebar">
-    <div id="sidebar-top">
-      <h1>Mi lector</h1>
-      <div id="drive-status">
-        <div id="drive-dot"></div>
-        <span id="drive-status-text">Sin sincronizar</span>
-      </div>
-    </div>
+<!-- MEASURER — div invisible para calcular alturas de párrafos -->
+<div id="page-measurer" aria-hidden="true"></div>
 
-    <div id="book-list"></div>
-
-    <div id="sidebar-bottom">
-      <input type="file" id="file-input" accept=".epub,.txt" multiple>
-      <div id="upload-area" onclick="document.getElementById('file-input').click()">
-        <p><span>+ Agregar libro</span><br>epub o txt</p>
-      </div>
-      <button id="drive-btn" onclick="initDrive()">Conectar Google Drive</button>
+<!-- SIDEBAR -->
+<div id="sidebar">
+  <div id="sidebar-top">
+    <h1>Mi lector</h1>
+    <div id="drive-status">
+      <div id="drive-dot"></div>
+      <span id="drive-status-text">Sin sincronizar</span>
     </div>
   </div>
 
-  <!-- ════ MAIN ════ -->
-  <div id="main">
+  <!-- Lista de libros -->
+  <div id="book-list"></div>
 
-    <!-- HEADER -->
-    <div id="header">
-      <div id="book-title-display">Mi Lector</div>
+  <!-- Índice de capítulos — visible cuando hay libro abierto -->
+  <div id="chapter-section">
+    <div id="chapter-section-header">Capítulos</div>
+    <div id="chapter-list"></div>
+  </div>
 
-      <div id="header-controls">
-        <div id="font-controls">
-          <button class="btn-font" id="btn-font-minus" onclick="changeFontSize(-1)" title="Texto más pequeño">A−</button>
-          <button class="btn-font" id="btn-font-plus"  onclick="changeFontSize(+1)" title="Texto más grande">A+</button>
-        </div>
+  <div id="sidebar-bottom">
+    <input type="file" id="file-input" accept=".epub,.txt" multiple>
+    <div id="upload-area" onclick="document.getElementById('file-input').click()">
+      <p><span>+ Agregar libro</span><br>epub o txt</p>
+    </div>
+    <button id="drive-btn" onclick="initDrive()">Conectar Google Drive</button>
+  </div>
+</div>
 
-        <button id="btn-theme" onclick="cycleTheme()" title="Cambiar tema">☀</button>
+<!-- MAIN -->
+<div id="main">
 
-        <div class="header-sep"></div>
-
-        <div id="tabs">
-          <button class="tab active" onclick="showTab('reader')">Leer</button>
-          <button class="tab"        onclick="showTab('highlights')">Subrayados</button>
-        </div>
+  <!-- HEADER -->
+  <div id="header">
+    <div id="book-title-display">Mi Lector</div>
+    <div id="header-controls">
+      <div id="font-controls">
+        <button class="btn-font" id="btn-font-minus" onclick="changeFontSize(-1)" title="Más pequeño">A−</button>
+        <button class="btn-font" id="btn-font-plus"  onclick="changeFontSize(+1)" title="Más grande">A+</button>
+      </div>
+      <button id="btn-theme" onclick="cycleTheme()" title="Cambiar tema">☀</button>
+      <div class="header-sep"></div>
+      <div id="tabs">
+        <button class="tab active" onclick="showTab('reader')">Leer</button>
+        <button class="tab"        onclick="showTab('highlights')">Subrayados</button>
+        <button class="tab"        onclick="showTab('library')">Biblioteca</button>
       </div>
     </div>
+  </div>
 
-    <!-- COLOR BAR — incluye botón de marcador -->
-    <div id="color-bar">
-      <span>Color:</span>
-      <div class="color-dot active" id="color-yellow" onclick="setColor('yellow')" title="Amarillo"></div>
-      <div class="color-dot"        id="color-blue"   onclick="setColor('blue')"   title="Azul"></div>
-      <div class="color-dot"        id="color-green"  onclick="setColor('green')"  title="Verde"></div>
-      <div class="color-dot"        id="color-pink"   onclick="setColor('pink')"   title="Rosa"></div>
+  <!-- COLOR BAR -->
+  <div id="color-bar">
+    <span>Color:</span>
+    <div class="color-dot active" id="color-yellow" onclick="setColor('yellow')" title="Amarillo"></div>
+    <div class="color-dot"        id="color-blue"   onclick="setColor('blue')"   title="Azul"></div>
+    <div class="color-dot"        id="color-green"  onclick="setColor('green')"  title="Verde"></div>
+    <div class="color-dot"        id="color-pink"   onclick="setColor('pink')"   title="Rosa"></div>
+    <div style="flex:1;"></div>
+    <button id="btn-bookmark" onclick="addBookmark()" title="Marcar esta página">🔖 Marcar</button>
+  </div>
 
-      <div style="flex:1;"></div>
+  <!-- CONTENT -->
+  <div id="content">
 
-      <button id="btn-bookmark" onclick="addBookmark()" title="Guardar posición actual">
-        🔖 Marcar
-      </button>
-    </div>
-
-    <!-- CONTENT -->
-    <div id="content">
-
-      <!-- Vista de lectura — los capítulos se renderizan aquí dinámicamente -->
-      <div id="reader-view">
+    <!-- LECTOR PAGINADO -->
+    <div id="reader-view">
+      <div id="page-content">
         <div id="empty-reader">
           Sube un epub o txt para empezar a leer.<br><br>
-          Conecta Google Drive para sincronizar tus subrayados entre dispositivos.
+          Conecta Google Drive para sincronizar tus subrayados.
         </div>
       </div>
-
-      <!-- Vista de subrayados -->
-      <div id="highlights-view">
-        <div id="hl-header">
-          <h3>Mis subrayados</h3>
-          <div id="hl-actions">
-            <button id="export-btn" onclick="exportTxt()">Exportar .txt</button>
-          </div>
-        </div>
-
-        <!-- Marcadores -->
-        <div id="bookmarks-section">
-          <div id="bookmarks-header">🔖 Marcadores</div>
-          <div id="bookmarks-list"></div>
-        </div>
-
-        <!-- Highlights -->
-        <div id="hl-list"></div>
-      </div>
-
-    </div><!-- /content -->
-
-    <!-- STATUS BAR — muestra capítulo y porcentaje -->
-    <div id="status-bar">
-      <span id="status-text">Listo</span>
-      <span id="sync-indicator"></span>
     </div>
 
-  </div><!-- /main -->
+    <!-- SUBRAYADOS -->
+    <div id="highlights-view">
+      <div id="hl-header">
+        <h3>Mis subrayados</h3>
+        <div id="hl-actions">
+          <button id="export-btn" onclick="exportTxt()">Exportar .txt</button>
+        </div>
+      </div>
+      <div id="bookmarks-section">
+        <div id="bookmarks-header">🔖 Marcadores</div>
+        <div id="bookmarks-list"></div>
+      </div>
+      <div id="hl-list"></div>
+    </div>
 
-  <!-- SELECTION TOOLBAR -->
-  <div id="sel-toolbar">
-    <button id="btn-hl"         onclick="doHighlight()">Subrayar</button>
-    <button id="btn-cancel-sel" onclick="hideSel()">✕</button>
+    <!-- BIBLIOTECA -->
+    <div id="library-view">
+      <div id="library-header">
+        <h3>Biblioteca</h3>
+      </div>
+      <div id="library-empty" style="display:none;">
+        <p>Aún no hay libros.<br>Sube un epub o txt para empezar.</p>
+      </div>
+      <div id="library-grid"></div>
+    </div>
+
+  </div><!-- /content -->
+
+  <!-- STATUS BAR -->
+  <div id="status-bar">
+    <button class="btn-nav" id="btn-prev" onclick="prevPage()" title="Página anterior" disabled>←</button>
+    <span id="status-text">Listo</span>
+    <button class="btn-nav" id="btn-next" onclick="nextPage()" title="Página siguiente" disabled>→</button>
+    <span id="sync-indicator"></span>
   </div>
 
-  <script src="app.js"></script>
+</div><!-- /main -->
+
+<!-- SELECTION TOOLBAR -->
+<div id="sel-toolbar">
+  <button id="btn-hl"         onclick="doHighlight()">Subrayar</button>
+  <button id="btn-cancel-sel" onclick="hideSel()">✕</button>
+</div>
+
+<script src="app.js"></script>
 </body>
 </html>
