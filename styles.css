@@ -560,11 +560,23 @@ body {
   margin: 0 0 1.5rem 0;
   padding-bottom: 0.6rem;
   border-bottom: 1px solid var(--border);
-  /* Cada capítulo ABRE en columna (página) nueva */
+  /* Cada capítulo ABRE en columna (página) nueva por defecto */
   break-before: column;
   -webkit-column-break-before: always;
   page-break-before: always;
   break-inside: avoid;
+}
+
+/* Variante "flow": para capítulos cortos / intercalares (portadillas
+   con solo título, ilustraciones sueltas) — NO forzar página nueva,
+   fluir con el contenido anterior. Resuelve el caso típico donde al
+   inicio del libro hay 5 archivos minúsculos (cubierta, sinopsis,
+   título, info, autor) y cada uno ocupaba una página entera vacía. */
+.chapter-header-inline.chapter-header-flow {
+  break-before: auto;
+  -webkit-column-break-before: auto;
+  page-break-before: auto;
+  margin-top: 1.5rem;
 }
 
 /* Empty state — overlay aparte, no es hijo del page-content */

@@ -137,10 +137,47 @@ window.addEventListener('load', async () => {
   }
   hideLoading();
   loadGapiScript();
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
-  }
+  setupServiceWorker();
 });
+
+/* Registra el SW y maneja auto-update:
+   - Cuando hay un nuevo SW disponible (instalado pero esperando), le
+     mandamos SKIP_WAITING para que tome control inmediato.
+   - Cuando el controlador cambia (controllerchange), recargamos la
+     página una vez. Esto convierte el flujo "subo un fix → al refrescar
+     ves los cambios" en transparente, sin que tengas que limpiar cache. */
+function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+
+  navigator.serviceWorker.register('./sw.js').then(reg => {
+    // Si ya hay un SW esperando (waiting), pedirle skipWaiting
+    if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+
+    // Detectar nuevos SW que se instalan después
+    reg.addEventListener('updatefound', () => {
+      const installing = reg.installing;
+      if (!installing) return;
+      installing.addEventListener('statechange', () => {
+        if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+          // Hay una versión nueva. Pedirle que tome control.
+          installing.postMessage({ type: 'SKIP_WAITING' });
+        }
+      });
+    });
+
+    // Forzar check de update cada vez que se carga la app
+    setTimeout(() => reg.update().catch(() => {}), 1500);
+  }).catch(() => {});
+
+  // Cuando el SW nuevo toma control, recargar la página una sola vez
+  // para que use los assets nuevos.
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloading) return;
+    reloading = true;
+    window.location.reload();
+  });
+}
 
 async function migrateFromLocalStorage() {
   try {
@@ -474,7 +511,7 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
     } catch (e) {}
   }
   // EPUB3: NAV
-  if (!Object.keys(titles).length) {
+  if (Object.keys(titles).length < spineIds.length) {
     const navItem = Object.values(manifest).find(i => i.properties.includes('nav'));
     if (navItem) {
       try {
@@ -491,6 +528,29 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
         }
       } catch (e) {}
     }
+  }
+  // FALLBACK: para cada archivo del spine sin título, leer el primer
+  // <h1>, <h2> o <h3> del HTML. Resuelve el caso típico de TOCs incompletos
+  // donde la portadilla de un capítulo no está listada.
+  for (let i = 0; i < spineIds.length; i++) {
+    if (titles[i]) continue;
+    const item = manifest[spineIds[i]];
+    if (!item) continue;
+    const fullPath = resolvePath(basePath, item.href.split('#')[0]);
+    const hf = zip.files[fullPath] || zip.files[Object.keys(zip.files).find(k => k.endsWith(item.href.split('#')[0]))];
+    if (!hf) continue;
+    try {
+      const raw = await hf.async('text');
+      // Probar h1, h2, h3 en orden
+      for (const tag of ['h1', 'h2', 'h3']) {
+        const hm = raw.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i'));
+        if (hm) {
+          // Stripear cualquier tag interno y normalizar
+          const txt = hm[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+          if (txt && txt.length < 200) { titles[i] = txt; break; }
+        }
+      }
+    } catch (e) {}
   }
   return titles;
 }
@@ -600,7 +660,12 @@ async function openBook(fullBook) {
   container.dataset.rendered = '';
   container.dataset.bookId = '';
 
-  showLoading('Preparando libro...');
+  // Mensaje proporcional al tamaño del libro
+  const n = allParagraphs.length;
+  const msg = n > 1500
+    ? `Calculando páginas (${n.toLocaleString('es')} párrafos)...`
+    : 'Preparando libro...';
+  showLoading(msg);
   await paginate({ keepAnchor: false });
   hideLoading();
   await restorePosition();
@@ -790,6 +855,14 @@ function waitForLayout() {
 }
 
 function renderBookHTML(container) {
+  // Pre-calcular cuántos párrafos tiene cada capítulo, para decidir si
+  // forzamos página nueva en su header. Capítulos "intercalares" (portadillas,
+  // página de título, imagen sola con epígrafe) NO deben ocupar página entera.
+  const paraCountPerChapter = {};
+  for (const p of allParagraphs) {
+    paraCountPerChapter[p.chapterIndex] = (paraCountPerChapter[p.chapterIndex] || 0) + 1;
+  }
+
   let html = '', lastCi = -1;
   for (let i = 0; i < allParagraphs.length; i++) {
     const para = allParagraphs[i];
@@ -797,7 +870,11 @@ function renderBookHTML(container) {
     if (ci !== lastCi && ci > 0) {
       const ch = currentBookChapters[ci];
       const lbl = ch && ch.title ? `${ci + 1}. ${ch.title}` : `Capítulo ${ci + 1}`;
-      html += `<div class="chapter-header-inline" data-chapter="${ci}">${escHtml(lbl)}</div>`;
+      // Si el capítulo es sustancial, forzar página nueva.
+      // Si es muy corto (<= 2 párrafos), fluir sin break.
+      const substantial = (paraCountPerChapter[ci] || 0) > 2;
+      const cls = substantial ? 'chapter-header-inline' : 'chapter-header-inline chapter-header-flow';
+      html += `<div class="${cls}" data-chapter="${ci}">${escHtml(lbl)}</div>`;
     }
     lastCi = ci;
     const withIdx = para.html.replace(/^(<[a-z][a-z0-9]*)/i, `$1 data-para-idx="${i}"`);
@@ -1196,24 +1273,35 @@ function findParaAncestor(node) {
   return null;
 }
 
-/* Si la selección actual cruza párrafos (por arrastre fuera de la página
-   visible — todo el libro está en el DOM), recortarla al final del primer
-   párrafo seleccionado. Esto evita el caso "seleccioné todo el libro". */
+/* Si la selección actual cruza párrafos (porque el usuario arrastró fuera
+   de la página visible — todo el libro está en el DOM), recortarla al final
+   del primer párrafo seleccionado. Esto evita el caso "seleccioné todo el
+   libro hacia adelante". Importante: chequeamos startContainer (no el
+   commonAncestor) porque si el end cae fuera del page-content, el
+   commonAncestor sube hasta body y la verificación falla. */
 function clampSelectionToOnePara() {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
   const range = sel.getRangeAt(0);
 
   const pageContent = document.getElementById('page-content');
-  if (!pageContent || !pageContent.contains(range.commonAncestorContainer)) return;
+  if (!pageContent) return;
+
+  // Solo nos importa si la selección NACIÓ dentro del page-content
+  if (!pageContent.contains(range.startContainer)) return;
 
   const startPara = findParaAncestor(range.startContainer);
-  const endPara   = findParaAncestor(range.endContainer);
+  if (!startPara) return;
 
-  if (!startPara || !endPara) return;
-  if (startPara === endPara) return;  // selección en un solo párrafo, todo bien
+  const endInside = pageContent.contains(range.endContainer);
+  const endPara   = endInside ? findParaAncestor(range.endContainer) : null;
 
-  // Cruza párrafos — truncar al final del startPara
+  // Si arrancó y terminó en el mismo párrafo, está todo bien.
+  if (endInside && startPara === endPara) return;
+
+  // Caso 1: el end está en un párrafo distinto, o
+  // Caso 2: el end cayó FUERA del page-content (sidebar, header, etc.)
+  // En ambos truncamos al final del startPara.
   const newRange = document.createRange();
   newRange.setStart(range.startContainer, range.startOffset);
   // Buscar el último nodo de texto del startPara
@@ -1221,9 +1309,11 @@ function clampSelectionToOnePara() {
   let lastText = null, n;
   while ((n = walker.nextNode())) lastText = n;
   if (lastText) {
-    newRange.setEnd(lastText, lastText.textContent.length);
-    sel.removeAllRanges();
-    sel.addRange(newRange);
+    try {
+      newRange.setEnd(lastText, lastText.textContent.length);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+    } catch (e) {}
   }
 }
 
@@ -1239,6 +1329,22 @@ document.addEventListener('touchend', e => {
 });
 document.addEventListener('mousedown', e => {
   if (!e.target.closest('#sel-toolbar')) hideSel();
+});
+
+/* Clamp también DURANTE el drag de selección, para que el usuario vea
+   la selección recortarse en vivo en lugar de "agarrar todo el libro"
+   visualmente y luego cortarse al soltar. Throttle con rAF para no
+   pegarse en loops (clampSelection dispara selectionchange). */
+let _selChangeFrame = 0;
+let _clamping = false;
+document.addEventListener('selectionchange', () => {
+  if (_clamping) return;
+  if (_selChangeFrame) return;
+  _selChangeFrame = requestAnimationFrame(() => {
+    _selChangeFrame = 0;
+    _clamping = true;
+    try { clampSelectionToOnePara(); } finally { _clamping = false; }
+  });
 });
 
 function handleSel() {
