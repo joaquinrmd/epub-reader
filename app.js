@@ -133,6 +133,7 @@ window.addEventListener('load', async () => {
   hideLoading();
   loadGapiScript();
   setupServiceWorker();
+  tryAutoreconnectDrive();
 });
 
 async function migrateFromLocalStorage() {
@@ -160,7 +161,14 @@ async function migrateFromLocalStorage() {
 
 async function loadState() {
   const books      = await dbGetAll('books');
-  state.books      = books.map(b => ({ id: b.id, title: b.title, author: b.author || '' }));
+  state.books      = books.map(b => ({
+    id: b.id,
+    title: b.title,
+    author: b.author || '',
+    fileType: b.fileType || 'epub',
+    driveEpubFileId: b.driveEpubFileId || null,
+    hasEpubInDrive: !!b.driveEpubFileId
+  }));
   state.highlights = await dbGetAll('highlights');
   const nid = await dbGet('prefs', 'nextId');         state.nextId        = nid ? nid.value : 1;
   const cur = await dbGet('prefs', 'currentBookId');  state.currentBookId = cur ? cur.value : null;
@@ -268,22 +276,46 @@ function loadGapiScript() {
   document.head.appendChild(s2);
 }
 
-function initDrive() {
-  if (!window.google) { setStatus('Cargando Google...'); setTimeout(initDrive, 1500); return; }
+function initDrive(silent) {
+  if (!window.google) {
+    if (!silent) setStatus('Cargando Google...');
+    setTimeout(() => initDrive(silent), 1500);
+    return;
+  }
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID, scope: SCOPES,
     callback: async resp => {
-      if (resp.error) { setStatus('Error al conectar Drive'); return; }
+      if (resp.error) {
+        if (!silent) setStatus('Error al conectar Drive');
+        return;
+      }
       driveReady = true;
       document.getElementById('drive-btn').textContent = 'Drive conectado';
       document.getElementById('drive-btn').classList.add('connected');
       document.getElementById('drive-dot').classList.add('connected');
       document.getElementById('drive-status-text').textContent = 'Google Drive activo';
-      setStatus('Conectado — sincronizando...');
+      // Recordar que el usuario conectó Drive — para autoreconectar en próximas sesiones
+      savePref('driveAutoconnect', true);
+      if (!silent) setStatus('Conectado — sincronizando...');
       await syncFromDrive();
     }
   });
-  tokenClient.requestAccessToken({ prompt: 'consent' });
+  // En modo silent (autoreconexión al iniciar): prompt vacío = no muestra
+  // ninguna UI si el usuario ya autorizó antes y el token sigue vigente.
+  // Si requiere interacción, falla silenciosamente.
+  // En modo manual (botón presionado): igual prompt vacío, pero si falla
+  // Google muestra la pantalla de consentimiento.
+  tokenClient.requestAccessToken({ prompt: '' });
+}
+
+/* Llamado al iniciar la app: si el usuario antes había conectado Drive,
+   intenta reconectar sin mostrar UI. */
+async function tryAutoreconnectDrive() {
+  const auto = await dbGet('prefs', 'driveAutoconnect').catch(() => null);
+  if (auto && auto.value) {
+    // Esperamos un poco a que cargue google.accounts
+    setTimeout(() => initDrive(true), 2500);
+  }
 }
 
 async function syncFromDrive() {
@@ -308,6 +340,8 @@ async function syncFromDrive() {
     setStatus('Error sincronizando — datos locales disponibles');
   }
   hideLoading();
+  // Subir libros que estaban pendientes (cargados sin Drive conectado)
+  uploadPendingBooks().catch(e => console.error('[uploadPending]', e));
 }
 
 async function mergeState(remote) {
@@ -318,11 +352,41 @@ async function mergeState(remote) {
   }
   for (const b of (remote.books || [])) {
     if (!bookIds.has(b.id)) {
-      state.books.push({ id: b.id, title: b.title, author: b.author || '' });
+      // Libro nuevo (que existe en Drive pero no acá)
+      const driveEpubFileId = b.driveEpubFileId || null;
+      const fileType = b.fileType || 'epub';
+      state.books.push({
+        id: b.id,
+        title: b.title,
+        author: b.author || '',
+        fileType,
+        driveEpubFileId,
+        hasEpubInDrive: !!driveEpubFileId
+      });
       await dbPut('books', {
         id: b.id, title: b.title, author: b.author || '',
-        chapters: [], coverBase64: null
+        chapters: [], coverBase64: null,
+        fileType,
+        driveEpubFileId,
+        hasEpubInDrive: !!driveEpubFileId
       });
+    } else {
+      // Libro ya existe localmente — actualizar driveEpubFileId si vino remoto
+      // (caso: este dispositivo subió el libro pero después se reinició y
+      //  perdió el driveEpubFileId, o vino de un dispositivo con info nueva)
+      const local = state.books.find(lb => lb.id === b.id);
+      if (local && b.driveEpubFileId && !local.driveEpubFileId) {
+        local.driveEpubFileId = b.driveEpubFileId;
+        local.hasEpubInDrive = true;
+        local.fileType = b.fileType || local.fileType || 'epub';
+        const fullLocal = await dbGet('books', b.id);
+        if (fullLocal) {
+          fullLocal.driveEpubFileId = b.driveEpubFileId;
+          fullLocal.hasEpubInDrive = true;
+          fullLocal.fileType = b.fileType || fullLocal.fileType || 'epub';
+          await dbPut('books', fullLocal);
+        }
+      }
     }
   }
   if ((remote.nextId || 0) > state.nextId) {
@@ -337,7 +401,13 @@ async function saveToDrive() {
   driveTimer = setTimeout(async () => {
     try {
       const payload = JSON.stringify({
-        books:      state.books.map(b => ({ id: b.id, title: b.title, author: b.author })),
+        books: state.books.map(b => ({
+          id: b.id,
+          title: b.title,
+          author: b.author,
+          fileType: b.fileType || 'epub',
+          driveEpubFileId: b.driveEpubFileId || null
+        })),
         highlights: state.highlights,
         nextId:     state.nextId
       });
@@ -361,6 +431,296 @@ async function saveToDrive() {
       setTimeout(() => { ind.textContent = ''; }, 2000);
     } catch (e) { console.error('[saveToDrive]', e); }
   }, 1200);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  DRIVE — EPUBs COMPLETOS (sync entre dispositivos)
+// ════════════════════════════════════════════════════════════════
+
+/* Sube el archivo original (EPUB o TXT) a Drive como book-{id}.epub
+   o book-{id}.txt en appDataFolder. Si ya existe (por ejemplo en otro
+   dispositivo), lo reemplaza.
+
+   Usa upload multipart porque tenemos metadata + bytes. Para archivos
+   grandes podríamos usar resumable, pero EPUBs típicos son <10MB
+   y multipart es más simple. */
+async function uploadBookFileToDrive(bookId, file, fileType) {
+  if (!driveReady) return;
+
+  const ind = document.getElementById('sync-indicator');
+  if (ind) ind.textContent = 'Subiendo...';
+
+  try {
+    const ext = fileType === 'txt' ? 'txt' : 'epub';
+    const filename = `book-${bookId}.${ext}`;
+
+    // Buscar si ya existe (al re-subir el mismo libro)
+    let existingId = null;
+    try {
+      const existing = await gapi.client.drive.files.list({
+        spaces: 'appDataFolder',
+        q: `name='${filename}'`,
+        fields: 'files(id,name)'
+      });
+      if (existing.result.files && existing.result.files.length > 0) {
+        existingId = existing.result.files[0].id;
+      }
+    } catch (e) {}
+
+    // Leer el archivo como ArrayBuffer
+    const arrayBuf = await file.arrayBuffer();
+    // Convertir a base64 para multipart upload
+    const base64 = arrayBufferToBase64(arrayBuf);
+
+    const boundary = '-------milector' + Date.now();
+    const delimiter = `\r\n--${boundary}\r\n`;
+    const closeDelim = `\r\n--${boundary}--`;
+    const contentType = ext === 'epub' ? 'application/epub+zip' : 'text/plain';
+
+    const metadata = existingId
+      ? {} // PATCH no requiere parents/name
+      : { name: filename, parents: ['appDataFolder'] };
+
+    const body =
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata) +
+      delimiter +
+      `Content-Type: ${contentType}\r\n` +
+      'Content-Transfer-Encoding: base64\r\n\r\n' +
+      base64 +
+      closeDelim;
+
+    const path = existingId
+      ? `/upload/drive/v3/files/${existingId}`
+      : '/upload/drive/v3/files';
+    const method = existingId ? 'PATCH' : 'POST';
+
+    const resp = await gapi.client.request({
+      path,
+      method,
+      params: { uploadType: 'multipart', fields: 'id' },
+      headers: { 'Content-Type': `multipart/related; boundary="${boundary}"` },
+      body
+    });
+
+    const driveId = resp.result.id;
+
+    // Guardar el driveFileId en el record del libro y limpiar el cache pending
+    const book = state.books.find(b => b.id === bookId);
+    if (book) {
+      book.driveEpubFileId = driveId;
+      book.hasEpubInDrive = true;
+    }
+    const full = await dbGet('books', bookId);
+    if (full) {
+      full.driveEpubFileId = driveId;
+      full.hasEpubInDrive = true;
+      delete full.pendingDriveUpload;  // ya no necesitamos el ArrayBuffer cacheado
+      await dbPut('books', full);
+    }
+
+    // Actualizar el JSON de Drive con el nuevo driveEpubFileId
+    saveToDrive();
+
+    if (ind) {
+      ind.textContent = 'Subido a Drive ✓';
+      setTimeout(() => { ind.textContent = ''; }, 2500);
+    }
+  } catch (e) {
+    console.error('[uploadBookFileToDrive]', e);
+    if (ind) ind.textContent = 'Error subiendo';
+  }
+}
+
+/* Baja el EPUB de un libro desde Drive y lo procesa con el parser
+   existente. Devuelve true si tuvo éxito. */
+async function downloadBookFromDrive(bookId) {
+  if (!driveReady) {
+    setStatus('Conectá Drive primero');
+    return false;
+  }
+
+  const book = state.books.find(b => b.id === bookId);
+  const full = await dbGet('books', bookId);
+  if (!book && !full) return false;
+
+  const driveId = (book && book.driveEpubFileId) ||
+                  (full && full.driveEpubFileId);
+  if (!driveId) {
+    setStatus('Este libro no tiene archivo en Drive');
+    return false;
+  }
+
+  const fileType = (book && book.fileType) || (full && full.fileType) || 'epub';
+
+  showLoading('Descargando "' + (book ? book.title : 'libro') + '" desde Drive...');
+
+  try {
+    // Descargar el archivo binario
+    const resp = await gapi.client.drive.files.get({
+      fileId: driveId,
+      alt: 'media'
+    });
+    // gapi devuelve `body` como string (las bytes raw como string).
+    // Lo convertimos a Uint8Array.
+    const bodyStr = resp.body;
+    const bytes = new Uint8Array(bodyStr.length);
+    for (let i = 0; i < bodyStr.length; i++) {
+      bytes[i] = bodyStr.charCodeAt(i) & 0xff;
+    }
+
+    // Crear un File-like para reusar el parser
+    const blob = new Blob([bytes], {
+      type: fileType === 'epub' ? 'application/epub+zip' : 'text/plain'
+    });
+    const fakeName = (book ? book.title : 'libro').replace(/[^\w\s.-]/g, '_') +
+                     (fileType === 'epub' ? '.epub' : '.txt');
+    const fakeFile = new File([blob], fakeName, { type: blob.type });
+
+    // Parsear y reemplazar el contenido del libro existente.
+    // Usamos un flag para que NO se cree un libro nuevo: vamos a sobrescribir.
+    if (fileType === 'epub') {
+      await parseAndReplaceBookContent(bookId, fakeFile);
+    } else {
+      const text = await fakeFile.text();
+      const html = text.split('\n').filter(l => l.trim())
+        .map(l => `<p>${escHtml(l.trim())}</p>`).join('');
+      const fullRec = await dbGet('books', bookId);
+      if (fullRec) {
+        fullRec.chapters = [{ index: 0, title: null, html, filename: '' }];
+        await dbPut('books', fullRec);
+      }
+    }
+
+    hideLoading();
+    setStatus('Libro descargado');
+    // Si es el libro actual, recargarlo
+    if (state.currentBookId === bookId) {
+      await selectBook(bookId);
+    } else {
+      renderLibrary();
+    }
+    return true;
+  } catch (e) {
+    console.error('[downloadBookFromDrive]', e);
+    hideLoading();
+    setStatus('Error al descargar — intentá de nuevo');
+    return false;
+  }
+}
+
+/* Parsea el EPUB descargado y guarda los chapters en el libro existente
+   (mismo bookId — no crea uno nuevo). Necesario para que los highlights
+   ya guardados sigan funcionando. */
+async function parseAndReplaceBookContent(bookId, file) {
+  const zip = await JSZip.loadAsync(file);
+  let chapters = [], coverBase64 = null;
+
+  let opfPath = null;
+  const cf = zip.files['META-INF/container.xml'];
+  if (cf) {
+    const t = await cf.async('text');
+    const m = t.match(/full-path="([^"]+)"/i);
+    if (m) opfPath = m[1];
+  }
+  if (!opfPath) opfPath = Object.keys(zip.files).find(f => f.toLowerCase().endsWith('.opf'));
+  if (!opfPath) {
+    // Fallback: agarrar todos los HTML
+    let html = '';
+    const fs = Object.keys(zip.files).filter(f => /\.(html|htm|xhtml)$/i.test(f)).slice(0, 40);
+    for (const f of fs) {
+      const raw = await zip.files[f].async('text');
+      const body = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      if (body) html += body[1] + '\n';
+    }
+    chapters = [{ index: 0, title: null, html: cleanEpubHtml(html), filename: '' }];
+  } else {
+    const opfText  = await zip.files[opfPath].async('text');
+    const basePath = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+    const manifest = {};
+    for (const m of opfText.matchAll(/<item\s[^>]*>/gi)) {
+      const tag = m[0];
+      const idM = tag.match(/\bid="([^"]+)"/);
+      const hrefM = tag.match(/\bhref="([^"]+)"/);
+      const tpM = tag.match(/\bmedia-type="([^"]+)"/);
+      const prM = tag.match(/\bproperties="([^"]+)"/);
+      if (idM && hrefM) {
+        manifest[idM[1]] = {
+          href: hrefM[1],
+          mediaType: tpM ? tpM[1] : '',
+          properties: prM ? prM[1] : ''
+        };
+      }
+    }
+
+    const coverItem = Object.values(manifest).find(i =>
+      i.properties.includes('cover-image') ||
+      (/image\/(jpeg|png|webp)/.test(i.mediaType) && i.href.toLowerCase().includes('cover'))
+    );
+    if (coverItem) {
+      try {
+        const cp = resolvePath(basePath, coverItem.href);
+        const cf2 = zip.files[cp] || zip.files[Object.keys(zip.files).find(k => k.endsWith(coverItem.href))];
+        if (cf2) {
+          const bytes = await cf2.async('base64');
+          coverBase64 = `data:${coverItem.mediaType};base64,${bytes}`;
+        }
+      } catch (e) {}
+    }
+
+    const spineIds = [...opfText.matchAll(/idref="([^"]+)"/g)].map(m => m[1]);
+    const chapterTitles = await extractChapterTitles(zip, manifest, basePath, spineIds);
+    let chapCount = 0;
+    for (let i = 0; i < spineIds.length; i++) {
+      const item = manifest[spineIds[i]];
+      if (!item) continue;
+      const href     = item.href.split('#')[0];
+      const fullPath = resolvePath(basePath, href);
+      const hf       = zip.files[fullPath] || zip.files[Object.keys(zip.files).find(k => k.endsWith(href))];
+      if (!hf) continue;
+      const raw  = await hf.async('text');
+      const body = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      if (!body) continue;
+      const cleaned = cleanEpubHtml(body[1]);
+      if (!cleaned.trim()) continue;
+      chapters.push({
+        index: chapCount++,
+        title: chapterTitles[i] || null,
+        html: cleaned,
+        filename: href.split('/').pop()
+      });
+    }
+  }
+
+  // Sobrescribir el libro existente conservando el id, highlights, etc.
+  const fullRec = await dbGet('books', bookId);
+  if (!fullRec) return;
+  fullRec.chapters = chapters;
+  if (coverBase64 && !fullRec.coverBase64) fullRec.coverBase64 = coverBase64;
+  await dbPut('books', fullRec);
+}
+
+/* Borra el archivo EPUB de Drive cuando se borra el libro localmente. */
+async function deleteBookFromDrive(driveId) {
+  if (!driveReady || !driveId) return;
+  try {
+    await gapi.client.drive.files.delete({ fileId: driveId });
+  } catch (e) {
+    console.error('[deleteBookFromDrive]', e);
+  }
+}
+
+/* Helper para convertir ArrayBuffer a base64 (necesario para multipart upload). */
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -464,8 +824,8 @@ async function loadEpub(file) {
     });
   }
 
-  if (!chapters.length) { await loadEpubFallback(zip, title); return; }
-  await addBook(title, author, chapters, coverBase64);
+  if (!chapters.length) { await loadEpubFallback(zip, title, file); return; }
+  await addBook(title, author, chapters, coverBase64, file);
 }
 
 async function extractChapterTitles(zip, manifest, basePath, spineIds) {
@@ -529,7 +889,7 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
   return titles;
 }
 
-async function loadEpubFallback(zip, title) {
+async function loadEpubFallback(zip, title, file) {
   let html = '';
   const fs = Object.keys(zip.files).filter(f => /\.(html|htm|xhtml)$/i.test(f)).slice(0, 40);
   for (const f of fs) {
@@ -537,7 +897,7 @@ async function loadEpubFallback(zip, title) {
     const body = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
     if (body) html += body[1] + '\n';
   }
-  await addBook(title, '', [{ index: 0, title: null, html: cleanEpubHtml(html), filename: '' }], null);
+  await addBook(title, '', [{ index: 0, title: null, html: cleanEpubHtml(html), filename: '' }], null, file);
 }
 
 function resolvePath(base, href) {
@@ -568,19 +928,76 @@ async function loadTxt(file) {
   const title = file.name.replace(/\.txt$/i, '');
   const html = text.split('\n').filter(l => l.trim())
     .map(l => `<p>${escHtml(l.trim())}</p>`).join('');
-  await addBook(title, '', [{ index: 0, title: null, html, filename: '' }], null);
+  await addBook(title, '', [{ index: 0, title: null, html, filename: '' }], null, file);
 }
 
-async function addBook(title, author, chapters, coverBase64) {
+async function addBook(title, author, chapters, coverBase64, originalFile) {
   const id = state.nextId++;
-  await dbPut('books', { id, title, author, chapters, coverBase64: coverBase64 || null });
-  state.books.push({ id, title, author });
+  const fileType = originalFile && originalFile.name.toLowerCase().endsWith('.epub')
+    ? 'epub' : 'txt';
+
+  // Si Drive no está conectado, guardar el archivo original en IndexedDB
+  // temporalmente. Cuando se conecte Drive, lo subimos y borramos del cache.
+  let pendingUpload = null;
+  if (!driveReady && originalFile) {
+    try {
+      pendingUpload = await originalFile.arrayBuffer();
+    } catch (e) { /* ignorar — el libro sigue funcionando local */ }
+  }
+
+  await dbPut('books', {
+    id, title, author, chapters,
+    coverBase64: coverBase64 || null,
+    fileType,
+    hasEpubInDrive: false,
+    driveEpubFileId: null,
+    pendingDriveUpload: pendingUpload  // ArrayBuffer crudo, undefined si Drive estaba conectado
+  });
+  state.books.push({ id, title, author, fileType, hasEpubInDrive: false, driveEpubFileId: null });
   await savePref('nextId', state.nextId);
   await savePref('currentBookId', id);
   saveToDrive();
   renderSidebar();
   await selectBook(id);
   setStatus(`"${title}" cargado`);
+
+  // Upload del archivo original a Drive en background (no bloquea)
+  if (driveReady && originalFile) {
+    uploadBookFileToDrive(id, originalFile, fileType).catch(e =>
+      console.error('[uploadBookFile]', e));
+  }
+}
+
+/* Cuando Drive se conecta, sube los libros que tenían pendingDriveUpload. */
+async function uploadPendingBooks() {
+  if (!driveReady) return;
+  const books = await dbGetAll('books');
+  for (const b of books) {
+    if (!b.pendingDriveUpload) continue;
+    if (b.driveEpubFileId) {
+      // Ya subido — limpiar el pending
+      delete b.pendingDriveUpload;
+      await dbPut('books', b);
+      continue;
+    }
+    try {
+      const blob = new Blob([b.pendingDriveUpload], {
+        type: b.fileType === 'epub' ? 'application/epub+zip' : 'text/plain'
+      });
+      const fakeName = b.title.replace(/[^\w\s.-]/g, '_') +
+                       (b.fileType === 'epub' ? '.epub' : '.txt');
+      const file = new File([blob], fakeName, { type: blob.type });
+      await uploadBookFileToDrive(b.id, file, b.fileType || 'epub');
+      // Borrar el pending del DB
+      const updated = await dbGet('books', b.id);
+      if (updated) {
+        delete updated.pendingDriveUpload;
+        await dbPut('books', updated);
+      }
+    } catch (e) {
+      console.error('[uploadPendingBooks]', b.id, e);
+    }
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -608,9 +1025,23 @@ async function selectBook(id) {
     if (full && full.chapters && full.chapters.length) {
       await openBook(full);
     } else if (full && full.html) {
+      // Migración legacy
       await openBook({
         chapters: [{ index: 0, title: null, html: full.html, filename: '' }]
       });
+    } else if (full && full.driveEpubFileId && driveReady) {
+      // No hay contenido local pero sí en Drive — ofrecer descargar
+      hideLoading();
+      mountEmptyBook('Este libro está en Drive pero no en este dispositivo.<br><br>' +
+                     `<button onclick="downloadBookFromDrive(${id})" ` +
+                     'style="padding:10px 18px;border-radius:8px;background:var(--accent);' +
+                     'color:#fff;border:none;cursor:pointer;font-family:inherit;' +
+                     'font-size:13px;font-weight:500;pointer-events:auto;">' +
+                     'Descargar desde Drive</button>');
+      // pointer-events:auto en el botón porque el padre tiene pointer-events:none
+      return;
+    } else if (full && full.driveEpubFileId && !driveReady) {
+      mountEmptyBook('Este libro está en Drive. Conectá Drive para descargarlo.');
     } else {
       mountEmptyBook('Este libro no tiene contenido en este dispositivo. Volvé a subir el EPUB para leerlo aquí.');
     }
@@ -1215,7 +1646,14 @@ function renderHighlights() {
 
 async function deleteBook(bookId) {
   const book = state.books.find(b => b.id === bookId);
-  if (!book || !confirm(`¿Borrar "${book.title}" y todos sus subrayados?\n\nEsta acción no se puede deshacer.`)) return;
+  if (!book) return;
+  const inDrive = book.driveEpubFileId || (await dbGet('books', bookId).catch(() => null) || {}).driveEpubFileId;
+  const msg = inDrive
+    ? `¿Borrar "${book.title}"?\n\nSe eliminará de este dispositivo, de Drive y todos sus subrayados. Esta acción no se puede deshacer.`
+    : `¿Borrar "${book.title}" y todos sus subrayados?\n\nEsta acción no se puede deshacer.`;
+  if (!confirm(msg)) return;
+  // Borrar de Drive primero (mientras tenemos el id en memoria)
+  if (inDrive) await deleteBookFromDrive(inDrive);
   await dbDelete('books', bookId);
   await dbDeleteAllByIndex('highlights', 'bookId', bookId);
   await dbDeleteAllByIndex('bookmarks',  'bookId', bookId);
@@ -1236,14 +1674,34 @@ async function deleteBook(bookId) {
 
 async function freeBookSpace(bookId) {
   const book = state.books.find(b => b.id === bookId);
-  if (!book || !confirm(`¿Liberar el espacio de "${book.title}"?\n\nEl contenido se eliminará de este dispositivo, pero tus subrayados se mantienen en Drive.`)) return;
+  if (!book) return;
   const full = await dbGet('books', bookId);
+  const inDrive = !!(full && full.driveEpubFileId);
+  const msg = inDrive
+    ? `¿Liberar el espacio de "${book.title}"?\n\nEl contenido se eliminará de este dispositivo. Tus subrayados y el archivo en Drive se mantienen — podés volver a descargar cuando quieras.`
+    : `¿Liberar el espacio de "${book.title}"?\n\nEl contenido se eliminará de este dispositivo, pero tus subrayados se mantienen en Drive. Para volver a leer tendrás que subir el EPUB de nuevo.`;
+  if (!confirm(msg)) return;
   if (!full) return;
-  await dbPut('books', { ...full, chapters: [], coverBase64: null });
+  // Conservar metadatos importantes
+  await dbPut('books', {
+    ...full,
+    chapters: [],
+    coverBase64: full.coverBase64  // mantener portada para la biblioteca
+  });
   if (state.currentBookId === bookId) {
-    mountEmptyBook('Contenido liberado.<br><br><strong style="color:var(--text)">Volvé a subir el EPUB para leer.</strong>');
+    if (inDrive) {
+      mountEmptyBook('Contenido liberado.<br><br>' +
+                     `<button onclick="downloadBookFromDrive(${bookId})" ` +
+                     'style="padding:10px 18px;border-radius:8px;background:var(--accent);' +
+                     'color:#fff;border:none;cursor:pointer;font-family:inherit;' +
+                     'font-size:13px;font-weight:500;pointer-events:auto;">' +
+                     'Descargar desde Drive</button>');
+    } else {
+      mountEmptyBook('Contenido liberado.<br><br><strong style="color:var(--text)">Volvé a subir el EPUB para leer.</strong>');
+    }
   }
-  setStatus('Espacio liberado — subrayados conservados');
+  setStatus('Espacio liberado');
+  renderSidebar();
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1261,6 +1719,7 @@ async function renderLibrary() {
     const posRec = await dbGet('prefs', `pos_${book.id}`).catch(() => null);
     const full   = await dbGet('books', book.id).catch(() => null);
     const hasCnt = full && full.chapters && full.chapters.length > 0;
+    const inDrive = !!(full && full.driveEpubFileId);
     let prog = 'Sin progreso';
     if (posRec && posRec.value) {
       const ci = posRec.value.chapterIndex || 0;
@@ -1273,20 +1732,46 @@ async function renderLibrary() {
     const coverHtml = full && full.coverBase64
       ? `<img src="${full.coverBase64}" alt="${escHtml(book.title)}" loading="lazy">`
       : `<div class="book-cover-initial">${(book.title[0] || '?').toUpperCase()}</div>`;
+
+    // Badge: "Sin contenido" si no hay local Y no hay en Drive,
+    // "En Drive" si no hay local pero sí en Drive.
+    let badge = '';
+    if (!hasCnt) {
+      badge = inDrive
+        ? '<div class="no-content-badge in-drive">En Drive</div>'
+        : '<div class="no-content-badge">Sin contenido</div>';
+    }
+
+    // Botones según estado:
+    // - Local: Abrir | Liberar | 🗑
+    // - En Drive (sin local): Descargar | 🗑
+    // - Sin contenido y sin Drive: Abrir (deshabilitado) | 🗑
+    let actionsHtml;
+    if (hasCnt) {
+      actionsHtml = `
+        <button class="btn-card btn-card-open" onclick="selectBook(${book.id})">Abrir</button>
+        <button class="btn-card btn-card-free" onclick="freeBookSpace(${book.id})">Liberar</button>
+        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+    } else if (inDrive) {
+      actionsHtml = `
+        <button class="btn-card btn-card-download" onclick="downloadBookFromDrive(${book.id})">Descargar</button>
+        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+    } else {
+      actionsHtml = `
+        <button class="btn-card btn-card-open" disabled>Abrir</button>
+        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+    }
+
     card.innerHTML = `
-      <div class="book-cover" onclick="selectBook(${book.id})">
-        ${coverHtml}${!hasCnt ? '<div class="no-content-badge">Sin contenido</div>' : ''}
+      <div class="book-cover" onclick="${hasCnt ? `selectBook(${book.id})` : (inDrive ? `downloadBookFromDrive(${book.id})` : '')}">
+        ${coverHtml}${badge}
       </div>
       <div class="book-card-info">
         <div class="book-card-title" title="${escHtml(book.title)}">${escHtml(book.title)}</div>
         ${book.author ? `<div class="book-card-author">${escHtml(book.author)}</div>` : ''}
         <div class="book-card-meta">${prog}<br>${hlc} subrayado${hlc !== 1 ? 's' : ''}</div>
       </div>
-      <div class="book-card-actions">
-        <button class="btn-card btn-card-open"   onclick="selectBook(${book.id})">Abrir</button>
-        <button class="btn-card btn-card-free"   onclick="freeBookSpace(${book.id})" ${!hasCnt ? 'disabled' : ''}>Liberar</button>
-        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>
-      </div>`;
+      <div class="book-card-actions">${actionsHtml}</div>`;
     grid.appendChild(card);
   }
 }

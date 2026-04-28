@@ -561,6 +561,8 @@ body {
   line-height: 1.7;
   pointer-events: none;
 }
+/* Pero los botones dentro del empty state SÍ son clickeables */
+#empty-reader button { pointer-events: auto; }
 #reader-view.has-book #empty-reader { display: none; }
 #reader-view { position: relative; }
 
@@ -853,11 +855,18 @@ body {
   white-space: nowrap;
 }
 .btn-card-open:hover    { border-color: var(--accent); color: var(--accent); }
+.btn-card-open:disabled { opacity: 0.35; cursor: default; }
 .btn-card-free          { color: var(--accent); border-color: var(--accent); }
 .btn-card-free:hover    { background: var(--accent); color: #fff; }
 .btn-card-free:disabled { opacity: 0.35; cursor: default; }
+.btn-card-download      { color: var(--accent); border-color: var(--accent); font-weight: 500; }
+.btn-card-download:hover { background: var(--accent); color: #fff; }
 .btn-card-delete        { color: #dc2626; border-color: #fca5a5; }
 .btn-card-delete:hover  { background: #fee2e2; }
+
+.no-content-badge.in-drive {
+  background: rgba(200, 149, 108, 0.85);  /* var(--accent) */
+}
 
 /* ─── STATUS BAR (con barra de progreso) ─── */
 #status-bar {
