@@ -17,7 +17,7 @@
    transparente (un blink y ya estás en la versión nueva).
    ════════════════════════════════════════════════════════ */
 
-const VERSION = 'v5-2026-04-27';
+const VERSION = 'v7-2026-04-27-vertical';
 const SHELL_CACHE  = 'mi-lector-shell-'  + VERSION;
 const ASSETS_CACHE = 'mi-lector-assets-' + VERSION;
 

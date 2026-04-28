@@ -1,20 +1,23 @@
 /* ════════════════════════════════════════════════════════════════
-   Mi Lector — app.js  (v4 — paginación robusta)
+   Mi Lector — app.js  (v7 — scroll vertical)
 
-   Cambios principales vs v3:
-   • Motor de paginación nuevo: el padding visual está en #reader-view
-     (no en #page-content), y W/H de columnas se calculan a partir del
-     padding-box interior del viewer. Esto elimina el bug de
-     "múltiples columnas simultáneas" y la última línea tapada.
-   • ResizeObserver: repagina al rotar iPad, redimensionar, etc.
-   • Repaginación al volver a la pestaña Leer (si estuvo oculta).
-   • Restauración de posición vía paragraph anchor (no pageIdx).
-   • Highlights con paraIdx + texto (más robustos al re-paginar);
-     fallback compatible con highlights viejos.
-   • document.fonts.ready + 2x rAF antes de medir.
-   • translate3d para forzar GPU acceleration en Safari.
+   Cambios vs v6:
+   • SE FUE el motor de paginación completo. Adiós column-fill,
+     paginate(), goToPage(), wrapper de clipping, ResizeObserver
+     del column flow, tap-zones, swipe horizontal, wheel-paging.
+   • El reader es scroll vertical nativo. iPad y desktop lo manejan
+     perfecto, sin trabajo extra del browser ni nuestro.
+   • La selección NO se desborda porque el usuario solo puede
+     arrastrar dentro del viewport visible. Sin trucos de clamp.
+   • Highlights se aplican UNA vez al renderizar el HTML. Como el
+     DOM es estable (sin re-paginación), persisten para siempre.
+   • Cambio de fuente = solo cambia `font-size`. INSTANTÁNEO.
+   • Posición guardada vía paraIdx del primer párrafo visible.
+     Restaurar = scrollIntoView de ese párrafo.
+   • Status bar nuevo: barra de progreso fina + "Cap. X · YY%".
 
    COMPATIBLE: esquemas de IndexedDB y Drive intactos.
+   Highlights antiguos siguen funcionando vía búsqueda por texto.
    ════════════════════════════════════════════════════════════════ */
 'use strict';
 
@@ -34,24 +37,15 @@ let prefs = { theme: 'day', fontSize: 17 };
 
 // ── Estado del libro abierto ──
 let allParagraphs       = [];
-let anchorMap           = {};   // { anchorId → paraIdx }  (links internos)
+let anchorMap           = {};   // { anchorId → paraIdx }   (links internos)
 let fileChapterMap      = {};   // { filename → chapterIndex }
-let chapterFirstPage    = {};   // { chapterIndex → pageIdx }
-let paragraphPageMap    = {};   // { paraIdx → pageIdx }
 let currentBookChapters = [];
-
-// ── Estado de paginación ──
-let pageWidth           = 0;    // ancho de columna = ancho interior del viewer
-let pageHeight          = 0;    // alto de columna = alto interior del viewer
-let totalPages          = 0;
-let currentPageIdx      = 0;
 let currentChapterIndex = 0;
 let totalChapters       = 0;
-let needsRepagination   = false;
 let currentTab          = 'reader';
 
 // ── UI ──
-let currentColor        = 'yellow';
+let currentColor   = 'yellow';
 
 // ── Drive ──
 let driveReady   = false;
@@ -59,7 +53,7 @@ let driveFileId  = null;
 let tokenClient  = null;
 let driveTimer   = null;
 let saveTimer    = null;
-let resizeTimer  = null;
+let scrollRaf    = 0;
 let db;
 
 // ════════════════════════════════════════════════════════════════
@@ -71,7 +65,7 @@ function openDB() {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = e => {
       const d = e.target.result;
-      if (!d.objectStoreNames.contains('books'))      d.createObjectStore('books', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('books')) d.createObjectStore('books', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('highlights')) {
         const hs = d.createObjectStore('highlights', { keyPath: 'id' });
         hs.createIndex('bookId', 'bookId', { unique: false });
@@ -126,9 +120,9 @@ window.addEventListener('load', async () => {
     await loadState();
     applyPrefs();
     renderSidebar();
-    setupNavigation();
-    setupResizeObserver();
-    setupFontsReadyHook();
+    setupReaderScroll();
+    setupSelectionHandlers();
+    setupKeyboard();
     if (state.currentBookId) await selectBook(state.currentBookId);
     renderHighlights();
   } catch (e) {
@@ -139,45 +133,6 @@ window.addEventListener('load', async () => {
   loadGapiScript();
   setupServiceWorker();
 });
-
-/* Registra el SW y maneja auto-update:
-   - Cuando hay un nuevo SW disponible (instalado pero esperando), le
-     mandamos SKIP_WAITING para que tome control inmediato.
-   - Cuando el controlador cambia (controllerchange), recargamos la
-     página una vez. Esto convierte el flujo "subo un fix → al refrescar
-     ves los cambios" en transparente, sin que tengas que limpiar cache. */
-function setupServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
-
-  navigator.serviceWorker.register('./sw.js').then(reg => {
-    // Si ya hay un SW esperando (waiting), pedirle skipWaiting
-    if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
-
-    // Detectar nuevos SW que se instalan después
-    reg.addEventListener('updatefound', () => {
-      const installing = reg.installing;
-      if (!installing) return;
-      installing.addEventListener('statechange', () => {
-        if (installing.state === 'installed' && navigator.serviceWorker.controller) {
-          // Hay una versión nueva. Pedirle que tome control.
-          installing.postMessage({ type: 'SKIP_WAITING' });
-        }
-      });
-    });
-
-    // Forzar check de update cada vez que se carga la app
-    setTimeout(() => reg.update().catch(() => {}), 1500);
-  }).catch(() => {});
-
-  // Cuando el SW nuevo toma control, recargar la página una sola vez
-  // para que use los assets nuevos.
-  let reloading = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (reloading) return;
-    reloading = true;
-    window.location.reload();
-  });
-}
 
 async function migrateFromLocalStorage() {
   try {
@@ -199,7 +154,7 @@ async function migrateFromLocalStorage() {
     if (old.nextId)        await dbPut('prefs', { key: 'nextId', value: old.nextId });
     if (old.currentBookId) await dbPut('prefs', { key: 'currentBookId', value: old.currentBookId });
     localStorage.removeItem('mi_lector_v2');
-  } catch (e) { /* migración silenciosa */ }
+  } catch (e) {}
 }
 
 async function loadState() {
@@ -214,6 +169,34 @@ async function loadState() {
 
 async function savePref(key, value) {
   try { await dbPut('prefs', { key, value }); } catch (e) {}
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SERVICE WORKER (auto-update)
+// ════════════════════════════════════════════════════════════════
+
+function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('./sw.js').then(reg => {
+    if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+    reg.addEventListener('updatefound', () => {
+      const installing = reg.installing;
+      if (!installing) return;
+      installing.addEventListener('statechange', () => {
+        if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+          installing.postMessage({ type: 'SKIP_WAITING' });
+        }
+      });
+    });
+    setTimeout(() => reg.update().catch(() => {}), 1500);
+  }).catch(() => {});
+
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloading) return;
+    reloading = true;
+    window.location.reload();
+  });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -238,18 +221,24 @@ function updateThemeBtn() {
   if (b) b.textContent = THEME_ICONS[prefs.theme];
 }
 
-async function changeFontSize(delta) {
+/* Cambio de fuente: solo actualiza la propiedad font-size.
+   El navegador re-acomoda el texto inline. NO hay que recalcular
+   nada porque no hay paginación. INSTANTÁNEO. */
+function changeFontSize(delta) {
   const old = prefs.fontSize;
   prefs.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, prefs.fontSize + delta));
   if (prefs.fontSize === old) return;
+
+  // Capturar párrafo visible para mantener la posición de lectura
+  const anchorIdx = getFirstVisibleParaIdx();
 
   document.getElementById('page-content').style.fontSize = prefs.fontSize + 'px';
   savePref('fontSize', prefs.fontSize);
   updateFontBtns();
 
-  if (allParagraphs.length) {
-    // Repagina conservando el párrafo visible
-    await paginate({ keepAnchor: true });
+  // Re-scroll al mismo párrafo (su posición Y cambió porque la fuente cambió)
+  if (anchorIdx != null) {
+    requestAnimationFrame(() => scrollToParaIdx(anchorIdx, 'auto'));
   }
 }
 
@@ -258,18 +247,6 @@ function updateFontBtns() {
   const p = document.getElementById('btn-font-plus');
   if (m) m.disabled = prefs.fontSize <= FONT_MIN;
   if (p) p.disabled = prefs.fontSize >= FONT_MAX;
-}
-
-/* Cuando las fuentes web (Lora/DM Sans) terminan de cargar
-   después del primer paint, re-paginamos para asegurarnos
-   de que las medidas estén correctas. */
-function setupFontsReadyHook() {
-  if (!document.fonts || !document.fonts.ready) return;
-  document.fonts.ready.then(() => {
-    if (allParagraphs.length && currentTab === 'reader') {
-      paginate({ keepAnchor: true });
-    }
-  });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -529,9 +506,7 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
       } catch (e) {}
     }
   }
-  // FALLBACK: para cada archivo del spine sin título, leer el primer
-  // <h1>, <h2> o <h3> del HTML. Resuelve el caso típico de TOCs incompletos
-  // donde la portadilla de un capítulo no está listada.
+  // Fallback: leer primer h1/h2/h3 del archivo si NCX/NAV no lo listó
   for (let i = 0; i < spineIds.length; i++) {
     if (titles[i]) continue;
     const item = manifest[spineIds[i]];
@@ -541,11 +516,9 @@ async function extractChapterTitles(zip, manifest, basePath, spineIds) {
     if (!hf) continue;
     try {
       const raw = await hf.async('text');
-      // Probar h1, h2, h3 en orden
       for (const tag of ['h1', 'h2', 'h3']) {
         const hm = raw.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i'));
         if (hm) {
-          // Stripear cualquier tag interno y normalizar
           const txt = hm[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
           if (txt && txt.length < 200) { titles[i] = txt; break; }
         }
@@ -606,7 +579,7 @@ async function addBook(title, author, chapters, coverBase64) {
   saveToDrive();
   renderSidebar();
   await selectBook(id);
-  setStatus(`"${title}" cargado — ${chapters.length} capítulo${chapters.length !== 1 ? 's' : ''}`);
+  setStatus(`"${title}" cargado`);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -631,7 +604,6 @@ async function selectBook(id) {
     if (full && full.chapters && full.chapters.length) {
       await openBook(full);
     } else if (full && full.html) {
-      // Migración legacy
       await openBook({
         chapters: [{ index: 0, title: null, html: full.html, filename: '' }]
       });
@@ -652,23 +624,17 @@ async function openBook(fullBook) {
   buildParagraphArray(currentBookChapters);
   renderChapterSidebar();
 
-  // Marcar el reader-view como "tiene libro" → habilita zonas tappables y oculta empty state
   document.getElementById('reader-view').classList.add('has-book');
 
-  // Forzar re-render del HTML en el page-content
   const container = document.getElementById('page-content');
-  container.dataset.rendered = '';
-  container.dataset.bookId = '';
+  renderBookHTML(container);
 
-  // Mensaje proporcional al tamaño del libro
-  const n = allParagraphs.length;
-  const msg = n > 1500
-    ? `Calculando páginas (${n.toLocaleString('es')} párrafos)...`
-    : 'Preparando libro...';
-  showLoading(msg);
-  await paginate({ keepAnchor: false });
-  hideLoading();
+  // Aplicar highlights guardados al DOM ya renderizado
+  applyHighlightsToContent();
+
+  // Restaurar posición
   await restorePosition();
+  updateProgress();
 }
 
 function mountEmptyBook(msg) {
@@ -676,9 +642,9 @@ function mountEmptyBook(msg) {
   document.getElementById('empty-reader').innerHTML = msg.replace(/\n/g, '<br>');
   const container = document.getElementById('page-content');
   container.innerHTML = '';
-  container.dataset.rendered = '';
-  container.dataset.bookId = '';
-  clearNavState();
+  document.getElementById('chapter-section').classList.remove('visible');
+  setProgress(0);
+  setStatusDirect('Listo');
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -741,128 +707,10 @@ function collectIds(el) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  ▼▼▼  MOTOR DE PAGINACIÓN  ▼▼▼
+//  RENDER DEL HTML DEL LIBRO
 // ════════════════════════════════════════════════════════════════
 
-/**
- * Recalcula la paginación del libro abierto.
- * @param {Object}  opts
- * @param {boolean} opts.keepAnchor - si true, conserva el párrafo visible al repaginar
- */
-async function paginate(opts) {
-  opts = opts || {};
-  const viewer    = document.getElementById('reader-view');
-  const clip      = document.getElementById('page-clip');
-  const container = document.getElementById('page-content');
-
-  if (!allParagraphs.length || !currentBookChapters.length) {
-    viewer.classList.remove('has-book');
-    return;
-  }
-
-  // Si el viewer no es visible (display:none), aplazar.
-  if (viewer.offsetWidth === 0 || viewer.offsetHeight === 0) {
-    needsRepagination = true;
-    return;
-  }
-
-  // 1. Capturar párrafo ancla (si aplica) ANTES de modificar nada
-  let anchorIdx = null;
-  if (opts.keepAnchor) anchorIdx = getFirstVisibleParaIdx();
-
-  // 2. Esperar fuentes
-  if (document.fonts && document.fonts.ready) {
-    try { await document.fonts.ready; } catch (e) {}
-  }
-
-  // 3. Reset transform y transición ANTES de medir
-  container.style.transition = 'none';
-  container.style.transform  = 'translate3d(0,0,0)';
-
-  // 4. Esperar a que el reflow se asiente
-  await waitForLayout();
-
-  // 5. Medir el padding-box interior del viewer
-  const inner = getViewerInnerSize(viewer);
-  if (inner.W <= 0 || inner.H <= 0) { needsRepagination = true; return; }
-
-  pageWidth  = inner.W;
-  pageHeight = inner.H;
-
-  // 6. Aplicar dimensiones EXACTAS al CLIP (la "ventana" de una página)
-  //    y al CONTENT (column-width = mismo ancho que el clip)
-  clip.style.width        = inner.W + 'px';
-  clip.style.height       = inner.H + 'px';
-  clip.style.right        = 'auto';   // override del CSS por defecto
-  clip.style.bottom       = 'auto';
-  container.style.fontSize    = prefs.fontSize + 'px';
-  container.style.columnWidth = inner.W + 'px';
-  // height/width del container vienen del CSS (100%/100%)
-
-  // 7. Renderizar HTML del libro (si no se hizo ya, o si cambió de libro)
-  const bookKey = String(state.currentBookId);
-  if (container.dataset.rendered !== '1' || container.dataset.bookId !== bookKey) {
-    renderBookHTML(container);
-    container.dataset.rendered = '1';
-    container.dataset.bookId = bookKey;
-  }
-
-  // 8. Esperar reflow tras inyectar HTML/cambiar dimensiones
-  await waitForLayout();
-
-  // 9. Calcular total de páginas — el container ahora es width:100% pero el
-  //    contenido en column layout se extiende horizontalmente; usamos
-  //    scrollWidth que reporta el ancho TOTAL del column flow.
-  totalPages = Math.max(1, Math.ceil((container.scrollWidth - 1) / pageWidth));
-
-  // 10. Construir mapas paragraph→page y chapter→page (solo headers chapter
-  //     son baratos; paragraphPageMap se construye lazy si hace falta)
-  buildChapterPageMap(container);
-  paragraphPageMapBuilt = false;
-
-  // 11. Aplicar highlights guardados
-  applyHighlightsToContent();
-
-  // 12. Decidir página destino
-  let target = currentPageIdx;
-  if (anchorIdx != null) {
-    const tp = paragraphToPage(anchorIdx, container);
-    if (tp != null) target = tp;
-  } else {
-    target = Math.min(currentPageIdx, totalPages - 1);
-  }
-  if (target < 0) target = 0;
-
-  goToPage(target, true);
-  needsRepagination = false;
-}
-
-function getViewerInnerSize(viewer) {
-  const cs = getComputedStyle(viewer);
-  const padTop    = parseFloat(cs.paddingTop)    || 0;
-  const padBottom = parseFloat(cs.paddingBottom) || 0;
-  const padLeft   = parseFloat(cs.paddingLeft)   || 0;
-  const padRight  = parseFloat(cs.paddingRight)  || 0;
-  // Math.floor para garantizar que el contenido no se desborda por subpíxeles
-  return {
-    W: Math.floor(viewer.clientWidth  - padLeft - padRight),
-    H: Math.floor(viewer.clientHeight - padTop  - padBottom)
-  };
-}
-
-function waitForLayout() {
-  return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-}
-
 function renderBookHTML(container) {
-  // Pre-calcular cuántos párrafos tiene cada capítulo, para decidir si
-  // forzamos página nueva en su header. Capítulos "intercalares" (portadillas,
-  // página de título, imagen sola con epígrafe) NO deben ocupar página entera.
-  const paraCountPerChapter = {};
-  for (const p of allParagraphs) {
-    paraCountPerChapter[p.chapterIndex] = (paraCountPerChapter[p.chapterIndex] || 0) + 1;
-  }
-
   let html = '', lastCi = -1;
   for (let i = 0; i < allParagraphs.length; i++) {
     const para = allParagraphs[i];
@@ -870,11 +718,7 @@ function renderBookHTML(container) {
     if (ci !== lastCi && ci > 0) {
       const ch = currentBookChapters[ci];
       const lbl = ch && ch.title ? `${ci + 1}. ${ch.title}` : `Capítulo ${ci + 1}`;
-      // Si el capítulo es sustancial, forzar página nueva.
-      // Si es muy corto (<= 2 párrafos), fluir sin break.
-      const substantial = (paraCountPerChapter[ci] || 0) > 2;
-      const cls = substantial ? 'chapter-header-inline' : 'chapter-header-inline chapter-header-flow';
-      html += `<div class="${cls}" data-chapter="${ci}">${escHtml(lbl)}</div>`;
+      html += `<div class="chapter-header-inline" data-chapter="${ci}">${escHtml(lbl)}</div>`;
     }
     lastCi = ci;
     const withIdx = para.html.replace(/^(<[a-z][a-z0-9]*)/i, `$1 data-para-idx="${i}"`);
@@ -883,230 +727,6 @@ function renderBookHTML(container) {
   container.innerHTML = html;
 }
 
-/* paragraphPageMap se construye PEREZOSAMENTE: solo cuando alguien
-   pregunta "en qué página está el párrafo X" (bookmarks goto, links
-   internos, restorePosition, repaginación tras cambio de fuente).
-   Esto ahorra ~10000 reads de getBoundingClientRect en libros largos. */
-let paragraphPageMapBuilt = false;
-
-function buildParagraphPageMap(container) {
-  paragraphPageMap = {};
-  if (!container) container = document.getElementById('page-content');
-  const W = pageWidth;
-  if (W <= 0) return;
-  // offsetLeft es relativo al offsetParent. Como el container tiene
-  // contain:layout, suele ser su propio offsetParent — pero por seguridad
-  // usamos el rect del container como referencia.
-  const containerRect = container.getBoundingClientRect();
-  container.querySelectorAll('[data-para-idx]').forEach(el => {
-    const idx = parseInt(el.dataset.paraIdx, 10);
-    const rect = el.getBoundingClientRect();
-    const offsetX = rect.left - containerRect.left;
-    paragraphPageMap[idx] = Math.max(0, Math.floor(offsetX / W));
-  });
-  paragraphPageMapBuilt = true;
-}
-
-/* Versión barata: solo busca un párrafo específico en lugar de
-   construir el mapa completo. Si el mapa ya está construido lo usa. */
-function paragraphToPage(paraIdx, container) {
-  if (paragraphPageMapBuilt) return paragraphPageMap[paraIdx];
-  if (!container) container = document.getElementById('page-content');
-  const el = container.querySelector(`[data-para-idx="${paraIdx}"]`);
-  if (!el || pageWidth <= 0) return null;
-  const containerRect = container.getBoundingClientRect();
-  const rect = el.getBoundingClientRect();
-  const offsetX = rect.left - containerRect.left;
-  // Si el container tiene transform aplicado, eso afecta su rect — pero
-  // como el rect del child también está afectado por el mismo transform,
-  // la diferencia (offsetX) es invariante. ✓
-  return Math.max(0, Math.floor(offsetX / pageWidth));
-}
-
-function buildChapterPageMap(container) {
-  chapterFirstPage = { 0: 0 };
-  const containerRect = container.getBoundingClientRect();
-  const W = pageWidth;
-  if (W <= 0) return;
-  container.querySelectorAll('[data-chapter]').forEach(el => {
-    const ci = parseInt(el.dataset.chapter, 10);
-    const rect = el.getBoundingClientRect();
-    const offsetX = rect.left - containerRect.left;
-    if (!(ci in chapterFirstPage)) {
-      chapterFirstPage[ci] = Math.max(0, Math.floor(offsetX / W));
-    }
-  });
-}
-
-/* Devuelve el paraIdx del primer párrafo visible en la página actual.
-   Usa elementFromPoint = O(1) en lugar de iterar todos los párrafos. */
-function getFirstVisibleParaIdx() {
-  const clip = document.getElementById('page-clip');
-  if (!clip) return null;
-  const r = clip.getBoundingClientRect();
-  if (r.width < 5 || r.height < 5) return null;
-  // Punto un poco hacia adentro del borde superior izquierdo del clip.
-  // Suficiente para caer dentro del primer párrafo visible.
-  const x = r.left + 8;
-  const y = r.top + 8;
-  let el = document.elementFromPoint(x, y);
-  if (!el) return null;
-  // Subir hasta encontrar un elemento con data-para-idx
-  while (el && el !== document.body) {
-    if (el.dataset && el.dataset.paraIdx !== undefined) {
-      return parseInt(el.dataset.paraIdx, 10);
-    }
-    el = el.parentElement;
-  }
-  // Fallback: probar un punto un poco más adentro (por si hay margins)
-  el = document.elementFromPoint(r.left + r.width / 2, r.top + 20);
-  while (el && el !== document.body) {
-    if (el.dataset && el.dataset.paraIdx !== undefined) {
-      return parseInt(el.dataset.paraIdx, 10);
-    }
-    el = el.parentElement;
-  }
-  return null;
-}
-
-function clearNavState() {
-  currentPageIdx = 0; currentChapterIndex = 0; totalPages = 0;
-  allParagraphs = []; paragraphPageMap = {}; chapterFirstPage = {};
-  currentBookChapters = []; totalChapters = 0;
-  const c = document.getElementById('page-content');
-  c.style.transition = 'none';
-  c.style.transform  = 'translate3d(0,0,0)';
-  updateNavButtons(); updateStatusBar();
-  document.getElementById('chapter-section').classList.remove('visible');
-}
-
-// ════════════════════════════════════════════════════════════════
-//  NAVEGACIÓN
-// ════════════════════════════════════════════════════════════════
-
-function goToPage(idx, skipTransition) {
-  if (!totalPages) return;
-  idx = Math.max(0, Math.min(idx, totalPages - 1));
-  currentPageIdx = idx;
-
-  const container = document.getElementById('page-content');
-  container.style.transition = skipTransition ? 'none' : 'transform 0.18s ease';
-  container.style.transform  = `translate3d(${-idx * pageWidth}px, 0, 0)`;
-
-  currentChapterIndex = computeCurrentChapter(idx);
-  updateStatusBar();
-  updateNavButtons();
-  updateChapterSidebar();
-
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(savePosition, 600);
-}
-
-function computeCurrentChapter(pageIdx) {
-  let ch = 0;
-  for (const ciStr in chapterFirstPage) {
-    const ci = parseInt(ciStr, 10);
-    if (chapterFirstPage[ci] <= pageIdx && ci > ch) ch = ci;
-  }
-  return ch;
-}
-
-function nextPage() { if (currentPageIdx < totalPages - 1) goToPage(currentPageIdx + 1); }
-function prevPage() { if (currentPageIdx > 0)              goToPage(currentPageIdx - 1); }
-
-function goToChapter(ci) {
-  for (let i = ci; i < totalChapters; i++) {
-    if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; }
-  }
-  for (let i = ci - 1; i >= 0; i--) {
-    if (chapterFirstPage[i] !== undefined) { goToPage(chapterFirstPage[i]); return; }
-  }
-}
-
-function setupNavigation() {
-  const viewer = document.getElementById('reader-view');
-
-  // Wheel: cambia página, no scrollea
-  let wheelLock = false;
-  viewer.addEventListener('wheel', e => {
-    e.preventDefault();
-    if (wheelLock) return;
-    wheelLock = true;
-    setTimeout(() => { wheelLock = false; }, 220);
-    if (e.deltaY > 0 || e.deltaX > 0) nextPage();
-    else                              prevPage();
-  }, { passive: false });
-
-  // Bloquear scroll/touch nativo dentro del reader
-  viewer.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
-
-  // Swipe horizontal en touch
-  let tx = 0, ty = 0, tt = 0;
-  viewer.addEventListener('touchstart', e => {
-    tx = e.touches[0].clientX;
-    ty = e.touches[0].clientY;
-    tt = Date.now();
-  }, { passive: true });
-  viewer.addEventListener('touchend', e => {
-    const dx = e.changedTouches[0].clientX - tx;
-    const dy = e.changedTouches[0].clientY - ty;
-    const dt = Date.now() - tt;
-    // Si fue un tap rápido sin desplazamiento, dejamos que la zona tappable lo maneje
-    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 250) return;
-    if (Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 45) {
-      if (dx < 0) nextPage();
-      else        prevPage();
-    }
-  }, { passive: true });
-
-  // Teclado (sólo en pestaña Leer y fuera de inputs)
-  document.addEventListener('keydown', e => {
-    if (currentTab !== 'reader') return;
-    const t = e.target;
-    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
-    if (['ArrowRight','ArrowDown','PageDown',' '].includes(e.key)) { e.preventDefault(); nextPage(); }
-    if (['ArrowLeft', 'ArrowUp',  'PageUp'].includes(e.key))       { e.preventDefault(); prevPage(); }
-  });
-}
-
-/* ResizeObserver: repagina cuando el viewer cambia de tamaño
-   (rotación de iPad, redimensionar ventana, mostrar/ocultar sidebar...) */
-function setupResizeObserver() {
-  if (!('ResizeObserver' in window)) return;
-  const viewer = document.getElementById('reader-view');
-  let lastW = 0, lastH = 0;
-  const ro = new ResizeObserver(entries => {
-    const cr = entries[0].contentRect;
-    if (Math.abs(cr.width - lastW) < 1 && Math.abs(cr.height - lastH) < 1) return;
-    lastW = cr.width; lastH = cr.height;
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(async () => {
-      if (allParagraphs.length && currentTab === 'reader') {
-        await paginate({ keepAnchor: true });
-      }
-    }, 120);
-  });
-  ro.observe(viewer);
-}
-
-function updateNavButtons() {
-  const prev = document.getElementById('btn-prev');
-  const next = document.getElementById('btn-next');
-  if (!prev || !next) return;
-  prev.disabled = currentPageIdx <= 0 || !totalPages;
-  next.disabled = currentPageIdx >= totalPages - 1 || !totalPages;
-}
-
-function updateStatusBar() {
-  if (!totalPages) { setStatusDirect('Listo'); return; }
-  const ch = currentBookChapters[currentChapterIndex];
-  const cl = ch && ch.title
-    ? `${currentChapterIndex + 1}. ${ch.title}`
-    : `Cap. ${currentChapterIndex + 1} de ${totalChapters}`;
-  setStatusDirect(`${cl} · Pág. ${currentPageIdx + 1} de ${totalPages}`);
-}
-
-// ── Hyperlinks internos ──
 function processLinksForRender(html) {
   return html.replace(/<a(\s[^>]*)?>/gi, (match, attrs) => {
     if (!attrs) return match;
@@ -1130,13 +750,146 @@ function handleInternalLink(anchor, file) {
   } else if (file && fileChapterMap[file] !== undefined) {
     pi = allParagraphs.findIndex(p => p.chapterIndex === fileChapterMap[file]);
   }
-  if (pi >= 0) {
-    const tp = paragraphToPage(pi);
-    if (tp != null) goToPage(tp);
+  if (pi >= 0) scrollToParaIdx(pi);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  NAVEGACIÓN POR SCROLL
+// ════════════════════════════════════════════════════════════════
+
+function setupReaderScroll() {
+  const viewer = document.getElementById('reader-view');
+  // Throttle con rAF para no saturar el render. Actualiza posición
+  // y guarda con debounce.
+  viewer.addEventListener('scroll', () => {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      updateProgress();
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(savePosition, 700);
+    });
+  }, { passive: true });
+}
+
+function setupKeyboard() {
+  document.addEventListener('keydown', e => {
+    if (currentTab !== 'reader') return;
+    const t = e.target;
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return;
+    const viewer = document.getElementById('reader-view');
+    if (!viewer) return;
+    // PageUp/PageDown/Space → scroll por viewport
+    if (e.key === 'PageDown' || e.key === ' ') {
+      e.preventDefault();
+      viewer.scrollBy({ top: viewer.clientHeight * 0.92, behavior: 'smooth' });
+    } else if (e.key === 'PageUp') {
+      e.preventDefault();
+      viewer.scrollBy({ top: -viewer.clientHeight * 0.92, behavior: 'smooth' });
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      viewer.scrollBy({ top: 80, behavior: 'auto' });
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      viewer.scrollBy({ top: -80, behavior: 'auto' });
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      viewer.scrollTo({ top: 0, behavior: 'smooth' });
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      viewer.scrollTo({ top: viewer.scrollHeight, behavior: 'smooth' });
+    }
+  });
+}
+
+function scrollToParaIdx(paraIdx, behavior) {
+  const container = document.getElementById('page-content');
+  if (!container) return;
+  const el = container.querySelector(`[data-para-idx="${paraIdx}"]`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: behavior || 'smooth', block: 'start' });
+}
+
+function goToChapter(ci) {
+  const container = document.getElementById('page-content');
+  if (!container) return;
+  // Capítulo 0 = arranque del libro. Los demás tienen header con data-chapter.
+  if (ci === 0) {
+    document.getElementById('reader-view').scrollTo({ top: 0, behavior: 'smooth' });
+    return;
+  }
+  const header = container.querySelector(`[data-chapter="${ci}"]`);
+  if (header) {
+    header.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else {
+    // Fallback: primer párrafo del capítulo
+    const firstPi = allParagraphs.findIndex(p => p.chapterIndex === ci);
+    if (firstPi >= 0) scrollToParaIdx(firstPi);
   }
 }
 
-// ── Sidebar de capítulos ──
+/* getFirstVisibleParaIdx — busca el primer párrafo visible usando
+   elementFromPoint (O(1)) para no iterar miles de elementos. */
+function getFirstVisibleParaIdx() {
+  const viewer = document.getElementById('reader-view');
+  if (!viewer) return null;
+  const r = viewer.getBoundingClientRect();
+  if (r.width < 5 || r.height < 5) return null;
+
+  // Probar varios puntos en la zona superior del viewport por si hay
+  // headers/elementos no-paragraph al principio
+  const points = [
+    [r.left + r.width / 2, r.top + 20],
+    [r.left + r.width / 2, r.top + 60],
+    [r.left + r.width / 2, r.top + r.height * 0.2],
+    [r.left + 30,           r.top + 40]
+  ];
+  for (const [x, y] of points) {
+    let el = document.elementFromPoint(x, y);
+    while (el && el !== document.body) {
+      if (el.dataset && el.dataset.paraIdx !== undefined) {
+        return parseInt(el.dataset.paraIdx, 10);
+      }
+      el = el.parentElement;
+    }
+  }
+  return null;
+}
+
+function updateProgress() {
+  const viewer = document.getElementById('reader-view');
+  if (!viewer || !allParagraphs.length) {
+    setProgress(0);
+    setStatusDirect('Listo');
+    return;
+  }
+  // Progreso: scrollTop / (scrollHeight - clientHeight)
+  const sh = viewer.scrollHeight - viewer.clientHeight;
+  const pct = sh > 0 ? Math.min(100, Math.max(0, (viewer.scrollTop / sh) * 100)) : 0;
+  setProgress(pct);
+
+  // Capítulo actual: el del primer párrafo visible
+  const idx = getFirstVisibleParaIdx();
+  if (idx != null && allParagraphs[idx]) {
+    currentChapterIndex = allParagraphs[idx].chapterIndex;
+  }
+  const ch = currentBookChapters[currentChapterIndex];
+  const cl = ch && ch.title
+    ? `${currentChapterIndex + 1}. ${ch.title}`
+    : `Cap. ${currentChapterIndex + 1} de ${totalChapters}`;
+  setStatusDirect(`${cl} · ${pct.toFixed(0)}%`);
+  updateChapterSidebar();
+}
+
+function setProgress(pct) {
+  const fill = document.getElementById('progress-fill');
+  if (fill) fill.style.width = pct + '%';
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SIDEBAR DE CAPÍTULOS
+// ════════════════════════════════════════════════════════════════
+
 function renderChapterSidebar() {
   const section = document.getElementById('chapter-section');
   const list    = document.getElementById('chapter-list');
@@ -1158,8 +911,6 @@ function renderChapterSidebar() {
 function updateChapterSidebar() {
   document.querySelectorAll('.chapter-item').forEach((el, i) =>
     el.classList.toggle('active', i === currentChapterIndex));
-  const active = document.querySelector('.chapter-item.active');
-  if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1167,10 +918,9 @@ function updateChapterSidebar() {
 // ════════════════════════════════════════════════════════════════
 
 async function savePosition() {
-  if (!state.currentBookId || !totalPages) return;
+  if (!state.currentBookId || !allParagraphs.length) return;
   const anchorParaIdx = getFirstVisibleParaIdx();
   await savePref(`pos_${state.currentBookId}`, {
-    pageIdx: currentPageIdx,
     chapterIndex: currentChapterIndex,
     fontSize: prefs.fontSize,
     anchorParaIdx: anchorParaIdx
@@ -1179,14 +929,17 @@ async function savePosition() {
 
 async function restorePosition() {
   const rec = await dbGet('prefs', `pos_${state.currentBookId}`);
-  if (!rec || !rec.value || !totalPages) { goToPage(0, true); return; }
-  // Preferir anchorParaIdx (sobrevive a cambios de fuente)
-  if (rec.value.anchorParaIdx != null) {
-    const tp = paragraphToPage(rec.value.anchorParaIdx);
-    if (tp != null) { goToPage(tp, true); return; }
+  // 2x rAF para asegurar que el layout terminó antes de scrollIntoView
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  if (!rec || !rec.value) {
+    document.getElementById('reader-view').scrollTo({ top: 0, behavior: 'auto' });
+    return;
   }
-  // Fallback a pageIdx
-  goToPage(Math.min(rec.value.pageIdx || 0, totalPages - 1), true);
+  if (rec.value.anchorParaIdx != null) {
+    scrollToParaIdx(rec.value.anchorParaIdx, 'auto');
+  } else {
+    document.getElementById('reader-view').scrollTo({ top: 0, behavior: 'auto' });
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1194,17 +947,22 @@ async function restorePosition() {
 // ════════════════════════════════════════════════════════════════
 
 async function addBookmark() {
-  if (!state.currentBookId || !totalPages) { setStatus('Primero abrí un libro'); return; }
+  if (!state.currentBookId || !allParagraphs.length) {
+    setStatus('Primero abrí un libro');
+    return;
+  }
   const ch      = currentBookChapters[currentChapterIndex];
   const chapStr = ch && ch.title
     ? `${currentChapterIndex + 1}. ${ch.title}`
     : `Cap. ${currentChapterIndex + 1}`;
-  const label   = `${chapStr} · Pág. ${currentPageIdx + 1}`;
+  const viewer  = document.getElementById('reader-view');
+  const sh      = viewer.scrollHeight - viewer.clientHeight;
+  const pct     = sh > 0 ? Math.round((viewer.scrollTop / sh) * 100) : 0;
+  const label   = `${chapStr} · ${pct}%`;
   const anchor  = getFirstVisibleParaIdx();
   const id      = state.nextId++;
   await dbPut('bookmarks', {
     id, bookId: state.currentBookId,
-    pageIdx: currentPageIdx,
     anchorParaIdx: anchor != null ? anchor : 0,
     label,
     ts: Date.now()
@@ -1220,13 +978,13 @@ async function renderBookmarks() {
   if (!bms || !bms.length) { section.style.display = 'none'; return; }
   section.style.display = 'block';
   list.innerHTML = '';
-  bms.sort((a, b) => a.pageIdx - b.pageIdx).forEach(bm => {
+  bms.sort((a, b) => (a.anchorParaIdx || 0) - (b.anchorParaIdx || 0)).forEach(bm => {
     const div = document.createElement('div');
     div.className = 'bookmark-card';
     div.innerHTML = `
       <span class="bookmark-label">${escHtml(bm.label)}</span>
       <div class="bookmark-actions">
-        <button class="bookmark-goto" data-para="${bm.anchorParaIdx}" data-page="${bm.pageIdx}">Ir</button>
+        <button class="bookmark-goto" data-para="${bm.anchorParaIdx || 0}">Ir</button>
         <button class="bookmark-delete" data-id="${bm.id}">✕</button>
       </div>`;
     list.appendChild(div);
@@ -1234,12 +992,8 @@ async function renderBookmarks() {
   list.querySelectorAll('.bookmark-goto').forEach(btn => {
     btn.addEventListener('click', () => {
       showTab('reader');
-      // Esperar al próximo frame para asegurarse de que el reader-view es visible
       requestAnimationFrame(() => {
-        const para = parseInt(btn.dataset.para, 10);
-        let target = paragraphToPage(para);
-        if (target == null) target = parseInt(btn.dataset.page, 10);
-        goToPage(Math.min(target, totalPages - 1));
+        scrollToParaIdx(parseInt(btn.dataset.para, 10));
       });
     });
   });
@@ -1262,90 +1016,17 @@ function setColor(c) {
   document.getElementById('color-' + c).classList.add('active');
 }
 
-/* Encuentra el ancestro con data-para-idx (un párrafo) — null si no hay. */
-function findParaAncestor(node) {
-  if (!node) return null;
-  let cur = node.nodeType === 1 ? node : node.parentElement;
-  while (cur && cur !== document.body) {
-    if (cur.dataset && cur.dataset.paraIdx !== undefined) return cur;
-    cur = cur.parentElement;
-  }
-  return null;
-}
-
-/* Si la selección actual cruza párrafos (porque el usuario arrastró fuera
-   de la página visible — todo el libro está en el DOM), recortarla al final
-   del primer párrafo seleccionado. Esto evita el caso "seleccioné todo el
-   libro hacia adelante". Importante: chequeamos startContainer (no el
-   commonAncestor) porque si el end cae fuera del page-content, el
-   commonAncestor sube hasta body y la verificación falla. */
-function clampSelectionToOnePara() {
-  const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-  const range = sel.getRangeAt(0);
-
-  const pageContent = document.getElementById('page-content');
-  if (!pageContent) return;
-
-  // Solo nos importa si la selección NACIÓ dentro del page-content
-  if (!pageContent.contains(range.startContainer)) return;
-
-  const startPara = findParaAncestor(range.startContainer);
-  if (!startPara) return;
-
-  const endInside = pageContent.contains(range.endContainer);
-  const endPara   = endInside ? findParaAncestor(range.endContainer) : null;
-
-  // Si arrancó y terminó en el mismo párrafo, está todo bien.
-  if (endInside && startPara === endPara) return;
-
-  // Caso 1: el end está en un párrafo distinto, o
-  // Caso 2: el end cayó FUERA del page-content (sidebar, header, etc.)
-  // En ambos truncamos al final del startPara.
-  const newRange = document.createRange();
-  newRange.setStart(range.startContainer, range.startOffset);
-  // Buscar el último nodo de texto del startPara
-  const walker = document.createTreeWalker(startPara, NodeFilter.SHOW_TEXT);
-  let lastText = null, n;
-  while ((n = walker.nextNode())) lastText = n;
-  if (lastText) {
-    try {
-      newRange.setEnd(lastText, lastText.textContent.length);
-      sel.removeAllRanges();
-      sel.addRange(newRange);
-    } catch (e) {}
-  }
-}
-
-document.addEventListener('mouseup', e => {
-  if (e.target.closest('#sel-toolbar')) return;
-  // Truncar primero, luego mostrar toolbar con la selección final
-  clampSelectionToOnePara();
-  handleSel();
-});
-document.addEventListener('touchend', e => {
-  if (e.target.closest('#sel-toolbar')) return;
-  setTimeout(() => { clampSelectionToOnePara(); handleSel(); }, 120);
-});
-document.addEventListener('mousedown', e => {
-  if (!e.target.closest('#sel-toolbar')) hideSel();
-});
-
-/* Clamp también DURANTE el drag de selección, para que el usuario vea
-   la selección recortarse en vivo en lugar de "agarrar todo el libro"
-   visualmente y luego cortarse al soltar. Throttle con rAF para no
-   pegarse en loops (clampSelection dispara selectionchange). */
-let _selChangeFrame = 0;
-let _clamping = false;
-document.addEventListener('selectionchange', () => {
-  if (_clamping) return;
-  if (_selChangeFrame) return;
-  _selChangeFrame = requestAnimationFrame(() => {
-    _selChangeFrame = 0;
-    _clamping = true;
-    try { clampSelectionToOnePara(); } finally { _clamping = false; }
+function setupSelectionHandlers() {
+  document.addEventListener('mouseup', e => {
+    if (!e.target.closest('#sel-toolbar')) handleSel();
   });
-});
+  document.addEventListener('touchend', e => {
+    if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 120);
+  });
+  document.addEventListener('mousedown', e => {
+    if (!e.target.closest('#sel-toolbar')) hideSel();
+  });
+}
 
 function handleSel() {
   const sel = window.getSelection();
@@ -1369,7 +1050,7 @@ async function doHighlight() {
   try {
     const range = sel.getRangeAt(0);
 
-    // Extraer paraIdx del párrafo donde inicia la selección
+    // paraIdx del párrafo donde inicia la selección
     let pNode = range.startContainer;
     while (pNode && (pNode.nodeType !== 1 || !pNode.hasAttribute || !pNode.hasAttribute('data-para-idx'))) {
       pNode = pNode.parentNode;
@@ -1409,10 +1090,6 @@ function wrapRange(range, id, color) {
   range.surroundContents(span);
 }
 
-/* Aplica todos los highlights del libro al DOM ya renderizado.
-   Estrategia:
-     1. Si el highlight tiene paraIdx → busca dentro de ese párrafo (preciso).
-     2. Si no, fallback: busca el texto en cualquier nodo (compat con highlights viejos). */
 function applyHighlightsToContent() {
   const container = document.getElementById('page-content');
   if (!container) return;
@@ -1422,7 +1099,6 @@ function applyHighlightsToContent() {
     if (container.querySelector(`[data-hl-id="${hl.id}"]`)) continue;
     let applied = false;
 
-    // Estrategia 1 — paraIdx (highlights nuevos)
     if (hl.paraIdx !== undefined && hl.paraIdx !== null) {
       const paraEl = container.querySelector(`[data-para-idx="${hl.paraIdx}"]`);
       if (paraEl && paraEl.textContent.includes(hl.text)) {
@@ -1430,7 +1106,6 @@ function applyHighlightsToContent() {
       }
     }
 
-    // Estrategia 2 — fallback global (highlights viejos / texto movido)
     if (!applied) {
       const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
       let node;
@@ -1546,10 +1221,8 @@ async function deleteBook(bookId) {
   if (state.currentBookId === bookId) {
     state.currentBookId = null;
     await savePref('currentBookId', null);
-    clearNavState();
     mountEmptyBook('Sube un libro para empezar.');
     document.getElementById('book-title-display').textContent = 'Mi Lector';
-    document.getElementById('chapter-section').classList.remove('visible');
   }
   saveToDrive();
   renderSidebar();
@@ -1564,9 +1237,7 @@ async function freeBookSpace(bookId) {
   if (!full) return;
   await dbPut('books', { ...full, chapters: [], coverBase64: null });
   if (state.currentBookId === bookId) {
-    clearNavState();
     mountEmptyBook('Contenido liberado.<br><br><strong style="color:var(--text)">Volvé a subir el EPUB para leer.</strong>');
-    document.getElementById('chapter-section').classList.remove('visible');
   }
   setStatus('Espacio liberado — subrayados conservados');
 }
@@ -1630,21 +1301,9 @@ function showTab(tab) {
 
   if (tab === 'highlights') { renderHighlights(); renderBookmarks(); }
   if (tab === 'library')    renderLibrary();
-  if (tab === 'reader' && allParagraphs.length) {
-    // Si la paginación quedó pendiente porque el viewer estaba oculto, hacerla ahora.
-    // También nos protegemos de cambios de tamaño que ocurrieron mientras el reader
-    // estaba con display:none (el ResizeObserver no dispara en ese caso).
-    requestAnimationFrame(() => {
-      const viewer = document.getElementById('reader-view');
-      const inner  = getViewerInnerSize(viewer);
-      if (needsRepagination || inner.W !== pageWidth || inner.H !== pageHeight) {
-        paginate({ keepAnchor: true });
-      }
-    });
-  }
 }
 
-// Estado inicial de pestañas (sin invocar renderers vacíos)
+// Estado inicial de pestañas
 document.getElementById('reader-view').style.display     = 'block';
 document.getElementById('highlights-view').style.display = 'none';
 document.getElementById('library-view').style.display    = 'none';
@@ -1697,7 +1356,7 @@ let statusTimer = null;
 function setStatus(msg) {
   document.getElementById('status-text').textContent = msg;
   clearTimeout(statusTimer);
-  statusTimer = setTimeout(updateStatusBar, 2500);
+  statusTimer = setTimeout(updateProgress, 2500);
 }
 function setStatusDirect(msg) { document.getElementById('status-text').textContent = msg; }
 function showLoading(msg) {

@@ -1,13 +1,11 @@
 /* ═══════════════════════════════════════════════
-   Mi Lector — styles.css  (v4 — paginación robusta)
-   Temas: day | sepia | night
+   Mi Lector — styles.css  (v7 — scroll vertical)
    ═══════════════════════════════════════════════ */
 
 @import url('https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;1,400&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap');
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* ─── TOKENS GLOBALES ─── */
 :root {
   --sidebar:        #1c1c1c;
   --sidebar-text:   #e8e0d5;
@@ -25,13 +23,16 @@
   --hl-green:       rgba(134,239,172,0.55);
   --hl-pink:        rgba(249,168,212,0.55);
 
-  /* Padding del marco de lectura — el #reader-view es el "marco",
-     el #page-content vive en su zona interior sin padding propio. */
-  --reader-pad-x: 60px;
+  /* Padding del contenedor de lectura.
+     Lateral: solo aplica si la ventana es muy angosta — la columna
+     central tiene max-width fijo y se centra sola en pantallas grandes. */
+  --reader-pad-x: 28px;
   --reader-pad-y: 36px;
+  /* Ancho máximo de la columna de texto (line-length cómodo: ~70 chars) */
+  --reader-max-width: 720px;
 }
 
-/* ─── TEMA DÍA ─── */
+/* ─── TEMAS ─── */
 :root, [data-theme="day"] {
   --bg:        #f7f4ef;
   --surface:   #ffffff;
@@ -42,8 +43,6 @@
   --border:    #e8e2da;
   --input-bg:  #f7f4ef;
 }
-
-/* ─── TEMA SEPIA ─── */
 [data-theme="sepia"] {
   --bg:        #f4ecd8;
   --surface:   #ede3ca;
@@ -54,8 +53,6 @@
   --border:    #d4c4a8;
   --input-bg:  #e8dcc4;
 }
-
-/* ─── TEMA NOCHE ─── */
 [data-theme="night"] {
   --bg:        #1a1a1a;
   --surface:   #242424;
@@ -71,14 +68,11 @@
   --hl-pink:   rgba(249,168,212,0.28);
 }
 
-/* ─── LAYOUT ROOT ───
-   100dvh para iOS (la barra de URL ya no come pixeles).
-   100vh como fallback en navegadores viejos. */
+/* ─── ROOT LAYOUT ─── */
 html, body {
   height: 100vh;
   height: 100dvh;
 }
-
 body {
   font-family: 'DM Sans', sans-serif;
   background: var(--bg);
@@ -86,7 +80,6 @@ body {
   overflow: hidden;
   font-size: 15px;
   color: var(--text);
-  /* Evita el bounce/scroll lateral del body en iOS */
   overscroll-behavior: none;
   -webkit-text-size-adjust: 100%;
 }
@@ -100,16 +93,13 @@ body {
   flex-shrink: 0;
   height: 100vh;
   height: 100dvh;
-  /* En iPad PWA, respetar el safe-area izquierdo */
   padding-left: env(safe-area-inset-left);
 }
-
 #sidebar-top {
   padding: 20px 16px 14px;
   border-bottom: 1px solid var(--sidebar-border);
   flex-shrink: 0;
 }
-
 #sidebar-top h1 {
   font-family: 'Lora', serif;
   font-size: 17px;
@@ -117,14 +107,11 @@ body {
   font-weight: 400;
   letter-spacing: 0.02em;
 }
-
 #drive-status {
   font-size: 11px;
   color: var(--sidebar-muted);
   margin-top: 4px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  display: flex; align-items: center; gap: 5px;
 }
 #drive-dot {
   width: 6px; height: 6px;
@@ -141,37 +128,29 @@ body {
   padding: 8px;
   min-height: 0;
 }
-
 .book-item {
   padding: 9px 10px;
   border-radius: 8px;
   cursor: pointer;
   margin-bottom: 3px;
   transition: background 0.15s;
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
+  display: flex; align-items: flex-start; gap: 6px;
 }
 .book-item:hover  { background: var(--sidebar-hover); }
 .book-item.active { background: var(--sidebar-active); }
-
 .book-item-info { flex: 1; min-width: 0; }
-
 .book-title {
   font-size: 13px;
   color: var(--sidebar-text);
   font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .book-item.active .book-title { color: var(--accent); }
 .book-meta { font-size: 11px; color: var(--sidebar-muted); margin-top: 2px; }
 
 .btn-book-delete {
   flex-shrink: 0;
-  background: none;
-  border: none;
+  background: none; border: none;
   color: #555;
   cursor: pointer;
   font-size: 13px;
@@ -184,7 +163,6 @@ body {
 .book-item:hover .btn-book-delete { opacity: 1; }
 .btn-book-delete:hover { color: #ef4444; }
 
-/* ─── CAPÍTULOS EN SIDEBAR ─── */
 #chapter-section {
   display: none;
   border-top: 1px solid var(--sidebar-border);
@@ -193,7 +171,6 @@ body {
   flex-shrink: 0;
 }
 #chapter-section.visible { display: block; }
-
 #chapter-section-header {
   font-size: 10px;
   letter-spacing: 0.08em;
@@ -206,7 +183,6 @@ body {
   background: var(--sidebar);
   z-index: 1;
 }
-
 .chapter-item {
   padding: 7px 14px 7px 18px;
   font-size: 12px;
@@ -214,23 +190,17 @@ body {
   cursor: pointer;
   transition: all 0.12s;
   display: block;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   border-left: 2px solid transparent;
-  margin: 0;
 }
 .chapter-item:hover  { background: var(--sidebar-hover); color: var(--sidebar-text); }
 .chapter-item.active { border-left-color: var(--accent); color: var(--accent); }
 
-/* ─── SIDEBAR BOTTOM ─── */
 #sidebar-bottom {
   padding: 12px;
   padding-bottom: max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--sidebar-border);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: flex; flex-direction: column; gap: 8px;
   flex-shrink: 0;
 }
 #upload-area {
@@ -258,10 +228,9 @@ body {
   color: var(--sidebar-muted);
   font-weight: 500;
   transition: all 0.15s;
-  text-align: center;
 }
-#drive-btn:hover      { border-color: var(--accent); color: var(--accent); }
-#drive-btn.connected  { border-color: #166534; background: #14532d22; color: #4ade80; }
+#drive-btn:hover     { border-color: var(--accent); color: var(--accent); }
+#drive-btn.connected { border-color: #166534; background: #14532d22; color: #4ade80; }
 
 /* ─── MAIN ─── */
 #main {
@@ -271,20 +240,15 @@ body {
   overflow: hidden;
   background: var(--surface);
   min-width: 0;
-  /* En iPad PWA, respetar safe-areas laterales (notch) */
   padding-right: env(safe-area-inset-right);
 }
 
-/* ─── HEADER ─── */
 #header {
   padding: 10px 20px;
   border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  display: flex; align-items: center; gap: 10px;
   flex-shrink: 0;
   min-height: 52px;
-  /* Respeta safe-area-top en PWA standalone (notch) */
   padding-top: max(10px, env(safe-area-inset-top));
 }
 #book-title-display {
@@ -294,22 +258,16 @@ body {
   font-weight: 400;
   flex: 1;
   min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #header-controls {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: flex; align-items: center; gap: 6px;
   flex-shrink: 0;
 }
 #font-controls { display: flex; align-items: center; gap: 2px; }
-
 .btn-font {
   font-family: 'DM Sans', sans-serif;
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 12px; font-weight: 500;
   padding: 5px 9px;
   border-radius: 6px;
   border: 1px solid var(--border);
@@ -333,15 +291,10 @@ body {
 }
 #btn-theme:hover { border-color: var(--accent); }
 
-.header-sep {
-  width: 1px; height: 20px;
-  background: var(--border);
-  flex-shrink: 0;
-}
+.header-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
 
 #tabs {
-  display: flex;
-  gap: 3px;
+  display: flex; gap: 3px;
   background: var(--bg);
   padding: 3px;
   border-radius: 8px;
@@ -357,7 +310,6 @@ body {
   background: transparent;
   font-family: 'DM Sans', sans-serif;
   transition: all 0.15s;
-  font-weight: 400;
 }
 .tab.active {
   background: var(--surface);
@@ -366,17 +318,13 @@ body {
   box-shadow: 0 1px 3px rgba(0,0,0,0.08);
 }
 
-/* ─── COLOR BAR ─── */
 #color-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: flex; align-items: center; gap: 6px;
   padding: 7px 20px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
 #color-bar > span { font-size: 11px; color: var(--muted); margin-right: 4px; }
-
 .color-dot {
   width: 18px; height: 18px;
   border-radius: 50%;
@@ -407,7 +355,6 @@ body {
 }
 #btn-bookmark:hover { border-color: var(--accent); color: var(--accent); }
 
-/* ─── CONTENT ─── */
 #content {
   flex: 1;
   display: flex;
@@ -416,86 +363,47 @@ body {
 }
 
 /* ════════════════════════════════════════════════════════
-   ▼▼▼  READER — MODO PÁGINAS (CSS Columns + clip wrapper) ▼▼▼
+   ▼  READER — SCROLL VERTICAL (v7)  ▼
    ════════════════════════════════════════════════════════
-   ARQUITECTURA v5 (corregida):
-   - #reader-view es el "marco" exterior. Lleva el padding visual
-     (margen blanco alrededor del texto). overflow:hidden de seguro.
-   - #page-clip es la VENTANA de exactamente UNA página.
-     Sus dimensiones exactas las setea JS:
-       top:    pad_y
-       left:   pad_x
-       width:  ancho interior del viewer
-       height: alto interior del viewer
-     overflow:hidden propio → recorta cualquier columna asomando.
-   - #page-content vive DENTRO del clip:
-       width:        max-content  (sumatoria de todas las columnas)
-       height:       100%         (=alto del clip = una página)
-       column-width: ancho del clip
-       column-fill:  auto          (fluye horizontal)
-   - Navegar = translate3d(-pageIdx * pageWidth, 0, 0) en page-content.
-     Como el clip recorta exactamente al ancho de una página, NUNCA
-     se asoma una columna vecina. (En v4 el bug era que el padding
-     del reader-view dejaba ver los primeros pad_x px de la columna
-     siguiente.)
+   Diseño:
+   - #reader-view es el contenedor scrolleable. overflow-y:auto.
+     Padding lateral mínimo (cuando la pantalla es angosta).
+   - #page-content es la columna de texto centrada con max-width
+     ~720px. Padding vertical para respirar arriba/abajo.
+   - Sin column layout. Sin paginación. Sin clipping wrapper.
+     Es scroll vertical nativo. iPad lo maneja perfecto.
    ════════════════════════════════════════════════════════ */
 
 #reader-view {
   flex: 1;
-  position: relative;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: var(--reader-bg);
   transition: background 0.25s;
   min-height: 0;
   min-width: 0;
-  padding: var(--reader-pad-y) var(--reader-pad-x);
-  /* iPad PWA: si hay safe-area-inset-bottom, se suma al padding inferior */
-  padding-bottom: max(var(--reader-pad-y), env(safe-area-inset-bottom));
-  /* Bloquea cualquier scroll/zoom nativo dentro del reader */
-  touch-action: none;
+  /* Padding lateral solo cuando la ventana es angosta. La columna
+     central tiene max-width fijo y se centra sola en pantallas grandes. */
+  padding: 0 var(--reader-pad-x);
+  /* Mejora el feel del scroll en iOS */
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
   user-select: text;
   -webkit-user-select: text;
 }
 
-#page-clip {
-  position: absolute;
-  /* top, left, width, height los setea JS al medir el padding-box
-     interior del viewer. Si JS aún no corrió, fallback a inset:0 con
-     el padding del padre (el browser lo respeta vía caja interior). */
-  top:    var(--reader-pad-y);
-  left:   var(--reader-pad-x);
-  right:  var(--reader-pad-x);
-  bottom: var(--reader-pad-y);
-  overflow: hidden;
-  /* Ayuda al browser a optimizar repintados al hacer translate */
-  contain: layout style paint;
-}
-
 #page-content {
-  /* width:max-content + column-width:W = el browser crea una columna por
-     "página" y EXTIENDE el contenido horizontalmente todo lo necesario.
-     Si pusiéramos width:100% (= W del clip), solo se crearía 1 columna
-     y el contenido se truncaría — el famoso bug. */
-  width: max-content;
-  height: 100%;
-  /* column-width lo setea JS al ancho exacto del clip */
-  column-fill: auto;
-  column-gap: 0;
-  /* GPU acceleration */
-  will-change: transform;
-  transition: transform 0.18s ease;
-  -webkit-transform: translate3d(0, 0, 0);
-          transform: translate3d(0, 0, 0);
-  /* Tipografía base — los hijos heredan */
+  /* Columna centrada de ancho cómodo de lectura */
+  max-width: var(--reader-max-width);
+  margin: 0 auto;
+  padding: var(--reader-pad-y) 0;
+  padding-bottom: max(var(--reader-pad-y), env(safe-area-inset-bottom));
   font-size: 17px;
   font-family: 'Lora', serif;
   color: var(--text);
-  /* contain — el contenido es independiente del exterior */
-  contain: layout style;
 }
 
-/* Tipografía del lector — TODOS los selectores deben caer dentro
-   de #page-content para que NO afecten la pestaña Subrayados o Biblioteca. */
+/* Tipografía del lector */
 #page-content p {
   font-family: 'Lora', serif;
   font-size: inherit;
@@ -505,7 +413,6 @@ body {
   text-align: justify;
   hyphens: auto;
   -webkit-hyphens: auto;
-  /* Evita que un párrafo solitario se parta dejando viuda/huérfana */
   orphans: 2;
   widows: 2;
 }
@@ -514,13 +421,9 @@ body {
   color: var(--text);
   line-height: 1.3;
   margin-bottom: 0.9rem;
-  margin-top: 0.4rem;
-  /* Encabezados nunca parten entre columnas */
-  break-inside: avoid;
-  -webkit-column-break-inside: avoid;
-  page-break-inside: avoid;
+  margin-top: 1.8rem;
 }
-#page-content h1 { font-size: 1.45em; font-weight: 500; }
+#page-content h1 { font-size: 1.45em; font-weight: 500; margin-top: 2.2rem; }
 #page-content h2 { font-size: 1.20em; font-weight: 500; }
 #page-content h3 { font-size: 1.05em; font-weight: 500; }
 #page-content h4 { font-size: 1.00em; font-weight: 500; font-style: italic; }
@@ -531,7 +434,6 @@ body {
   margin: 0 0 1.2rem 0.5rem;
   font-style: italic;
   font-family: 'Lora', serif;
-  font-size: inherit;
 }
 #page-content ul, #page-content ol {
   margin: 0 0 1.2rem 1.5rem;
@@ -549,7 +451,7 @@ body {
 #page-content em, #page-content i { font-style: italic; }
 #page-content strong, #page-content b { font-weight: 500; }
 
-/* Encabezado de capítulo dentro del contenido — abre página nueva */
+/* Encabezado de capítulo: separación visual sin forzar página nueva */
 .chapter-header-inline {
   font-family: 'DM Sans', sans-serif;
   font-size: 0.78em;
@@ -557,29 +459,18 @@ body {
   color: var(--muted);
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  margin: 0 0 1.5rem 0;
+  margin: 3.5rem 0 1.5rem 0;
   padding-bottom: 0.6rem;
   border-bottom: 1px solid var(--border);
-  /* Cada capítulo ABRE en columna (página) nueva por defecto */
-  break-before: column;
-  -webkit-column-break-before: always;
-  page-break-before: always;
-  break-inside: avoid;
+  /* Margen extra arriba para que se vea como "comienzo de capítulo".
+     scroll-margin-top sirve para que cuando hagamos scrollIntoView,
+     el header no quede pegado al borde superior del viewport. */
+  scroll-margin-top: 24px;
 }
+/* El primer chapter header del libro no necesita el margen grande arriba */
+.chapter-header-inline:first-child { margin-top: 0.5rem; }
 
-/* Variante "flow": para capítulos cortos / intercalares (portadillas
-   con solo título, ilustraciones sueltas) — NO forzar página nueva,
-   fluir con el contenido anterior. Resuelve el caso típico donde al
-   inicio del libro hay 5 archivos minúsculos (cubierta, sinopsis,
-   título, info, autor) y cada uno ocupaba una página entera vacía. */
-.chapter-header-inline.chapter-header-flow {
-  break-before: auto;
-  -webkit-column-break-before: auto;
-  page-break-before: auto;
-  margin-top: 1.5rem;
-}
-
-/* Empty state — overlay aparte, no es hijo del page-content */
+/* Empty state — overlay aparte */
 #empty-reader {
   position: absolute;
   inset: 0;
@@ -594,25 +485,9 @@ body {
   padding: 40px 20px;
   line-height: 1.7;
   pointer-events: none;
-  /* Visible por defecto, se oculta cuando hay libro */
 }
 #reader-view.has-book #empty-reader { display: none; }
-
-/* Zonas tappables invisibles (iPad) — solo activas con libro abierto */
-.tap-zone {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 18%;
-  z-index: 5;
-  cursor: pointer;
-  display: none;
-  background: transparent;
-  -webkit-tap-highlight-color: transparent;
-}
-#reader-view.has-book .tap-zone { display: block; }
-#tap-zone-left  { left: 0; }
-#tap-zone-right { right: 0; }
+#reader-view { position: relative; }
 
 /* ─── HIGHLIGHTS ─── */
 .hl {
@@ -620,7 +495,6 @@ body {
   padding: 1px 2px;
   cursor: pointer;
   transition: filter 0.15s;
-  /* No partir highlights entre columnas */
   -webkit-box-decoration-break: clone;
           box-decoration-break: clone;
 }
@@ -636,15 +510,12 @@ body {
   padding: 28px;
   display: none;
   flex-direction: column;
-  gap: 0;
   background: var(--bg);
   overflow-y: auto;
   transition: background 0.25s;
 }
 #hl-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 20px;
   flex-shrink: 0;
 }
@@ -668,7 +539,6 @@ body {
 }
 #export-btn:hover { opacity: 0.8; }
 
-/* ─── MARCADORES ─── */
 #bookmarks-section {
   display: none;
   margin-bottom: 20px;
@@ -687,9 +557,7 @@ body {
   letter-spacing: 0.03em;
 }
 .bookmark-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   transition: background 0.15s;
@@ -701,9 +569,7 @@ body {
   color: var(--text);
   flex: 1;
   min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   margin-right: 10px;
 }
 .bookmark-actions { display: flex; gap: 6px; flex-shrink: 0; }
@@ -733,7 +599,6 @@ body {
 }
 .bookmark-delete:hover { color: #dc2626; border-color: #fecaca; }
 
-/* ─── HIGHLIGHTS LIST ─── */
 #hl-list { flex-shrink: 0; }
 .hl-card {
   border: 1px solid var(--border);
@@ -807,9 +672,7 @@ body {
   transition: background 0.25s;
 }
 #library-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 24px;
   flex-shrink: 0;
 }
@@ -845,9 +708,7 @@ body {
 
 .book-cover {
   aspect-ratio: 2 / 3;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: flex; align-items: center; justify-content: center;
   background: var(--accent-light);
   overflow: hidden;
   flex-shrink: 0;
@@ -857,11 +718,7 @@ body {
 [data-theme="night"] .book-cover { background: #2d2219; }
 [data-theme="sepia"] .book-cover { background: #e8d8b8; }
 
-.book-cover img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
+.book-cover img { width: 100%; height: 100%; object-fit: cover; }
 .book-cover-initial {
   font-family: 'Lora', serif;
   font-size: 44px;
@@ -884,24 +741,17 @@ body {
 .book-card-info {
   padding: 10px 12px 4px;
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  display: flex; flex-direction: column; gap: 2px;
 }
 .book-card-title {
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 12px; font-weight: 500;
   color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .book-card-author {
   font-size: 11px;
   color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .book-card-meta {
   font-size: 11px;
@@ -911,8 +761,7 @@ body {
 }
 
 .book-card-actions {
-  display: flex;
-  gap: 5px;
+  display: flex; gap: 5px;
   padding: 6px 10px 10px;
 }
 .btn-card {
@@ -926,7 +775,6 @@ body {
   background: transparent;
   color: var(--muted);
   transition: all 0.15s;
-  text-align: center;
   white-space: nowrap;
 }
 .btn-card-open:hover    { border-color: var(--accent); color: var(--accent); }
@@ -936,36 +784,42 @@ body {
 .btn-card-delete        { color: #dc2626; border-color: #fca5a5; }
 .btn-card-delete:hover  { background: #fee2e2; }
 
-/* ─── STATUS BAR ─── */
+/* ─── STATUS BAR (con barra de progreso) ─── */
 #status-bar {
-  padding: 7px 16px;
   border-top: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 6px;
   flex-shrink: 0;
-  /* iPad PWA: respeta el inset inferior (home indicator) */
-  padding-bottom: max(7px, env(safe-area-inset-bottom));
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
   background: var(--surface);
 }
-.btn-nav {
-  font-size: 15px;
-  padding: 4px 12px;
-  border-radius: 5px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--muted);
-  cursor: pointer;
-  transition: all 0.15s;
-  font-family: 'DM Sans', sans-serif;
-  flex-shrink: 0;
-  line-height: 1.2;
+#progress-track {
+  height: 2px;
+  background: var(--border);
+  position: relative;
+  overflow: hidden;
 }
-.btn-nav:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.btn-nav:disabled { opacity: 0.3; cursor: default; }
-
-#status-text { font-size: 12px; color: var(--muted); flex: 1; text-align: center; }
-#sync-indicator { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+#progress-fill {
+  position: absolute;
+  top: 0; left: 0;
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s ease-out;
+}
+#status-row {
+  padding: 7px 16px;
+  display: flex; align-items: center; gap: 10px;
+}
+#status-text {
+  font-size: 12px;
+  color: var(--muted);
+  flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#sync-indicator {
+  font-size: 11px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
 
 /* ─── SELECTION TOOLBAR ─── */
 #sel-toolbar {
@@ -1001,8 +855,7 @@ body {
   inset: 0;
   background: rgba(247,244,239,0.92);
   z-index: 9998;
-  align-items: center;
-  justify-content: center;
+  align-items: center; justify-content: center;
   flex-direction: column;
   gap: 12px;
   backdrop-filter: blur(2px);
@@ -1021,34 +874,23 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ─── SCROLLBARS ─── */
+#reader-view::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+#reader-view:hover::-webkit-scrollbar-thumb { background: var(--muted); }
 
-/* ─── RESPONSIVE — IPAD/MOBILE ─── */
-/* iPad portrait: reduce el padding lateral del lector */
+/* ─── RESPONSIVE ─── */
 @media (max-width: 1024px) {
-  :root {
-    --reader-pad-x: 44px;
-    --reader-pad-y: 30px;
-  }
+  :root { --reader-max-width: 680px; }
 }
-
 @media (max-width: 760px) {
-  :root {
-    --reader-pad-x: 28px;
-    --reader-pad-y: 24px;
-  }
+  :root { --reader-pad-x: 20px; --reader-pad-y: 28px; }
   #sidebar { width: 200px; }
   #book-title-display { display: none; }
   #font-controls { display: none; }
-  .tap-zone { width: 22%; }
 }
-
 @media (max-width: 480px) {
-  :root {
-    --reader-pad-x: 20px;
-    --reader-pad-y: 20px;
-  }
+  :root { --reader-pad-x: 18px; --reader-pad-y: 24px; }
   #sidebar { display: none; }
 }

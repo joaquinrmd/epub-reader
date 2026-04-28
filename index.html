@@ -33,10 +33,8 @@
     </div>
   </div>
 
-  <!-- Lista de libros -->
   <div id="book-list"></div>
 
-  <!-- Índice de capítulos — visible cuando hay libro abierto -->
   <div id="chapter-section">
     <div id="chapter-section-header">Capítulos</div>
     <div id="chapter-list"></div>
@@ -54,7 +52,6 @@
 <!-- MAIN -->
 <div id="main">
 
-  <!-- HEADER -->
   <div id="header">
     <div id="book-title-display">Mi Lector</div>
     <div id="header-controls">
@@ -72,7 +69,6 @@
     </div>
   </div>
 
-  <!-- COLOR BAR -->
   <div id="color-bar">
     <span>Color:</span>
     <div class="color-dot active" id="color-yellow" onclick="setColor('yellow')" title="Amarillo"></div>
@@ -80,30 +76,19 @@
     <div class="color-dot"        id="color-green"  onclick="setColor('green')"  title="Verde"></div>
     <div class="color-dot"        id="color-pink"   onclick="setColor('pink')"   title="Rosa"></div>
     <div style="flex:1;"></div>
-    <button id="btn-bookmark" onclick="addBookmark()" title="Marcar esta página">🔖 Marcar</button>
+    <button id="btn-bookmark" onclick="addBookmark()" title="Marcar esta posición">🔖 Marcar</button>
   </div>
 
-  <!-- CONTENT -->
   <div id="content">
-
-    <!-- LECTOR PAGINADO -->
+    <!-- LECTOR (scroll vertical nativo) -->
     <div id="reader-view">
-      <!-- #page-clip = ventana de UNA página (overflow:hidden propio).
-           Sus dimensiones exactas las setea JS al ancho/alto interior del viewer. -->
-      <div id="page-clip">
-        <div id="page-content"></div>
-      </div>
-      <!-- Empty state como overlay aparte (no es hijo del page-content) -->
+      <div id="page-content"></div>
       <div id="empty-reader">
         Sube un epub o txt para empezar a leer.<br><br>
         Conecta Google Drive para sincronizar tus subrayados.
       </div>
-      <!-- Zonas tappables invisibles para iPad: tocar lados pasa página -->
-      <div id="tap-zone-left"  class="tap-zone" onclick="prevPage()" aria-hidden="true"></div>
-      <div id="tap-zone-right" class="tap-zone" onclick="nextPage()" aria-hidden="true"></div>
     </div>
 
-    <!-- SUBRAYADOS -->
     <div id="highlights-view">
       <div id="hl-header">
         <h3>Mis subrayados</h3>
@@ -118,7 +103,6 @@
       <div id="hl-list"></div>
     </div>
 
-    <!-- BIBLIOTECA -->
     <div id="library-view">
       <div id="library-header">
         <h3>Biblioteca</h3>
@@ -128,18 +112,20 @@
       </div>
       <div id="library-grid"></div>
     </div>
-
-  </div><!-- /content -->
-
-  <!-- STATUS BAR -->
-  <div id="status-bar">
-    <button class="btn-nav" id="btn-prev" onclick="prevPage()" title="Página anterior" disabled>←</button>
-    <span id="status-text">Listo</span>
-    <button class="btn-nav" id="btn-next" onclick="nextPage()" title="Página siguiente" disabled>→</button>
-    <span id="sync-indicator"></span>
   </div>
 
-</div><!-- /main -->
+  <!-- STATUS BAR con barra de progreso fina -->
+  <div id="status-bar">
+    <div id="progress-track" aria-hidden="true">
+      <div id="progress-fill"></div>
+    </div>
+    <div id="status-row">
+      <span id="status-text">Listo</span>
+      <span id="sync-indicator"></span>
+    </div>
+  </div>
+
+</div>
 
 <!-- SELECTION TOOLBAR -->
 <div id="sel-toolbar">
