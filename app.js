@@ -166,7 +166,8 @@ async function loadState() {
     title: b.title,
     author: b.author || '',
     fileType: b.fileType || 'epub',
-    driveEpubFileId: b.driveEpubFileId || null
+    driveEpubFileId: b.driveEpubFileId || null,
+    remoteKnown: !!b.remoteKnown
   }));
   state.highlights = await dbGetAll('highlights');
   const nid = await dbGet('prefs', 'nextId');         state.nextId        = nid ? nid.value : 1;
@@ -386,7 +387,10 @@ async function syncFromDrive() {
       // Reconciliar libros con sus archivos en Drive (busca book-{id}.epub
       // para libros que no tengan driveEpubFileId cacheado)
       await reconcileBooksWithDrive();
-      renderSidebar(); renderHighlights();
+      renderSidebar();
+      renderHighlights();
+      // Si la pestaña actual es biblioteca, re-renderizar (libros pueden haberse borrado)
+      if (currentTab === 'library') renderLibrary();
       setStatus('Sincronizado con Drive');
     } else {
       await saveToDrive();
@@ -444,14 +448,53 @@ async function reconcileBooksWithDrive() {
   }
 }
 
+/* Mergea el estado remoto (JSON de Drive) con el local.
+
+   Estrategia para detectar borrados:
+   - Cuando un libro/highlight aparece en el JSON remoto, lo marcamos
+     localmente con `remoteKnown: true`.
+   - En sucesivos syncs, si un item estaba marcado como remoteKnown pero
+     YA NO aparece en el remoto, significa que fue borrado en otro
+     dispositivo → lo borramos localmente.
+   - Items sin `remoteKnown` son nuevos en ESTE dispositivo y aún no
+     subieron — no se tocan, esperan a que el próximo saveToDrive los
+     suba al JSON remoto. */
 async function mergeState(remote) {
-  const hlIds   = new Set(state.highlights.map(h => h.id));
-  const bookIds = new Set(state.books.map(b => b.id));
+  const remoteHlIds   = new Set((remote.highlights || []).map(h => h.id));
+  const remoteBookIds = new Set((remote.books      || []).map(b => b.id));
+
+  // ─── HIGHLIGHTS ───
+  // 1. Agregar highlights nuevos del remoto
+  const localHlIds = new Set(state.highlights.map(h => h.id));
   for (const h of (remote.highlights || [])) {
-    if (!hlIds.has(h.id)) { state.highlights.push(h); await dbPut('highlights', h); }
+    if (!localHlIds.has(h.id)) {
+      h.remoteKnown = true;
+      state.highlights.push(h);
+      await dbPut('highlights', h);
+    } else {
+      // Ya existe — marcarlo como conocido por remoto (si no lo estaba)
+      const local = state.highlights.find(lh => lh.id === h.id);
+      if (local && !local.remoteKnown) {
+        local.remoteKnown = true;
+        await dbPut('highlights', local);
+      }
+    }
   }
+  // 2. Borrar highlights que estaban marcados como remoteKnown pero ya no aparecen
+  const hlsToDelete = state.highlights.filter(h =>
+    h.remoteKnown && !remoteHlIds.has(h.id)
+  );
+  for (const h of hlsToDelete) {
+    await dbDelete('highlights', h.id).catch(() => {});
+  }
+  if (hlsToDelete.length) {
+    state.highlights = state.highlights.filter(h => !hlsToDelete.some(d => d.id === h.id));
+  }
+
+  // ─── BOOKS ───
+  const localBookIds = new Set(state.books.map(b => b.id));
   for (const b of (remote.books || [])) {
-    if (!bookIds.has(b.id)) {
+    if (!localBookIds.has(b.id)) {
       // Libro nuevo en este dispositivo — viene con driveEpubFileId si está en Drive
       const driveEpubFileId = b.driveEpubFileId || null;
       const fileType = b.fileType || 'epub';
@@ -460,29 +503,62 @@ async function mergeState(remote) {
         title: b.title,
         author: b.author || '',
         fileType,
-        driveEpubFileId
+        driveEpubFileId,
+        remoteKnown: true
       });
       await dbPut('books', {
         id: b.id, title: b.title, author: b.author || '',
         chapters: [], coverBase64: null,
         fileType,
-        driveEpubFileId
+        driveEpubFileId,
+        remoteKnown: true
       });
     } else {
-      // Libro ya existe localmente — actualizar driveEpubFileId si vino remoto
+      // Libro ya existe localmente
       const local = state.books.find(lb => lb.id === b.id);
-      if (local && b.driveEpubFileId && !local.driveEpubFileId) {
-        local.driveEpubFileId = b.driveEpubFileId;
-        local.fileType = b.fileType || local.fileType || 'epub';
-        const fullLocal = await dbGet('books', b.id);
-        if (fullLocal) {
-          fullLocal.driveEpubFileId = b.driveEpubFileId;
-          fullLocal.fileType = b.fileType || fullLocal.fileType || 'epub';
-          await dbPut('books', fullLocal);
+      if (local) {
+        local.remoteKnown = true;
+        // Actualizar driveEpubFileId si vino remoto y no lo teníamos
+        if (b.driveEpubFileId && !local.driveEpubFileId) {
+          local.driveEpubFileId = b.driveEpubFileId;
         }
+        if (b.fileType && !local.fileType) local.fileType = b.fileType;
+      }
+      const fullLocal = await dbGet('books', b.id);
+      if (fullLocal) {
+        fullLocal.remoteKnown = true;
+        if (b.driveEpubFileId && !fullLocal.driveEpubFileId) {
+          fullLocal.driveEpubFileId = b.driveEpubFileId;
+        }
+        if (b.fileType && !fullLocal.fileType) fullLocal.fileType = b.fileType;
+        await dbPut('books', fullLocal);
       }
     }
   }
+  // Borrar libros que estaban marcados como remoteKnown pero ya no aparecen
+  const booksToDelete = state.books.filter(b =>
+    b.remoteKnown && !remoteBookIds.has(b.id)
+  );
+  for (const b of booksToDelete) {
+    // Borrar de IndexedDB y todos sus datos relacionados
+    await dbDelete('books', b.id).catch(() => {});
+    await dbDeleteAllByIndex('highlights', 'bookId', b.id).catch(() => {});
+    await dbDeleteAllByIndex('bookmarks',  'bookId', b.id).catch(() => {});
+    await dbDelete('prefs', `pos_${b.id}`).catch(() => {});
+    // Si era el libro abierto, limpiar UI
+    if (state.currentBookId === b.id) {
+      state.currentBookId = null;
+      await savePref('currentBookId', null);
+      mountEmptyBook('Este libro fue borrado en otro dispositivo.');
+      document.getElementById('book-title-display').textContent = 'Mi Lector';
+    }
+  }
+  if (booksToDelete.length) {
+    const toDeleteIds = new Set(booksToDelete.map(b => b.id));
+    state.books      = state.books.filter(b => !toDeleteIds.has(b.id));
+    state.highlights = state.highlights.filter(h => !toDeleteIds.has(h.bookId));
+  }
+
   if ((remote.nextId || 0) > state.nextId) {
     state.nextId = remote.nextId;
     await savePref('nextId', state.nextId);
@@ -502,7 +578,11 @@ async function saveToDrive() {
           fileType: b.fileType || 'epub',
           driveEpubFileId: b.driveEpubFileId || null
         })),
-        highlights: state.highlights,
+        highlights: state.highlights.map(h => {
+          // No serializar el flag interno remoteKnown al JSON remoto
+          const { remoteKnown, ...rest } = h;
+          return rest;
+        }),
         nextId:     state.nextId
       });
       if (driveFileId) {
@@ -520,6 +600,29 @@ async function saveToDrive() {
           method: 'PATCH', params: { uploadType: 'media' }, body: payload
         });
       }
+
+      // Después del upload exitoso: marcar todos los items como remoteKnown.
+      // Eso establece la baseline para detectar borrados en sucesivos syncs.
+      let touched = false;
+      for (const b of state.books) {
+        if (!b.remoteKnown) {
+          b.remoteKnown = true;
+          const full = await dbGet('books', b.id);
+          if (full) {
+            full.remoteKnown = true;
+            await dbPut('books', full);
+          }
+          touched = true;
+        }
+      }
+      for (const h of state.highlights) {
+        if (!h.remoteKnown) {
+          h.remoteKnown = true;
+          await dbPut('highlights', h);
+          touched = true;
+        }
+      }
+
       const ind = document.getElementById('sync-indicator');
       ind.textContent = 'Guardado ✓';
       setTimeout(() => { ind.textContent = ''; }, 2000);

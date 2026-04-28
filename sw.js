@@ -17,7 +17,7 @@
    transparente (un blink y ya estás en la versión nueva).
    ════════════════════════════════════════════════════════ */
 
-const VERSION = 'v12-2026-04-28-ipad-highlight';
+const VERSION = 'v13-2026-04-28-delete-sync';
 const SHELL_CACHE  = 'mi-lector-shell-'  + VERSION;
 const ASSETS_CACHE = 'mi-lector-assets-' + VERSION;
 
