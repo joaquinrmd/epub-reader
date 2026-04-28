@@ -1599,58 +1599,144 @@ function setColor(c) {
   document.getElementById('color-' + c).classList.add('active');
 }
 
+/* Estado para que el subrayado funcione en iPad.
+   En iOS, tocar un botón cancela la selección antes de que corra el handler,
+   así que window.getSelection() devuelve isCollapsed=true cuando llega
+   doHighlight(). Solución: clonamos el Range y el texto cuando se muestra
+   el toolbar y los reusamos en doHighlight() sin volver a pedir la selección. */
+let pendingHighlight = null;  // { range: Range, text: string, paraIdx: number|null }
+
 function setupSelectionHandlers() {
   document.addEventListener('mouseup', e => {
     if (!e.target.closest('#sel-toolbar')) handleSel();
   });
+  // En touchend esperamos un tick para que la selección se establezca,
+  // y luego mostramos el toolbar.
   document.addEventListener('touchend', e => {
-    if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 120);
+    if (!e.target.closest('#sel-toolbar')) setTimeout(handleSel, 150);
   });
+  // No ocultamos en mousedown si el clic es en el toolbar (sino se cierra
+  // antes de que el botón Subrayar reciba el evento).
   document.addEventListener('mousedown', e => {
     if (!e.target.closest('#sel-toolbar')) hideSel();
   });
+
+  // En el botón Subrayar usamos pointerdown con preventDefault para evitar
+  // que iOS limpie la selección antes de que corra doHighlight.
+  // (Nota: en mobile, "click" llega DESPUÉS de que iOS ya canceló la
+  //  selección. Por eso disparamos el highlight en pointerdown.)
+  const btnHl = document.getElementById('btn-hl');
+  if (btnHl) {
+    btnHl.addEventListener('pointerdown', e => {
+      // Prevenimos default para que el touch NO quite la selección
+      e.preventDefault();
+      e.stopPropagation();
+      doHighlight();
+    });
+  }
+  const btnCancel = document.getElementById('btn-cancel-sel');
+  if (btnCancel) {
+    btnCancel.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideSel();
+      // Limpiar la selección visible también
+      const sel = window.getSelection();
+      if (sel) sel.removeAllRanges();
+    });
+  }
 }
 
 function handleSel() {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideSel(); return; }
-  if (!document.getElementById('page-content').contains(sel.anchorNode)) { hideSel(); return; }
-  const range = sel.getRangeAt(0), rect = range.getBoundingClientRect();
+  const pageContent = document.getElementById('page-content');
+  if (!pageContent.contains(sel.anchorNode)) { hideSel(); return; }
+
+  const range = sel.getRangeAt(0);
+
+  // Capturar el paraIdx del párrafo donde empieza la selección
+  let pNode = range.startContainer;
+  while (pNode && (pNode.nodeType !== 1 || !pNode.hasAttribute || !pNode.hasAttribute('data-para-idx'))) {
+    pNode = pNode.parentNode;
+  }
+  const paraIdx = pNode && pNode.dataset && pNode.dataset.paraIdx !== undefined
+    ? parseInt(pNode.dataset.paraIdx, 10) : null;
+
+  // Guardar el range CLONADO y el texto. El clon evita que cuando iOS
+  // limpie la selección, perdamos la referencia.
+  pendingHighlight = {
+    range: range.cloneRange(),
+    text: sel.toString().trim(),
+    paraIdx: (paraIdx != null && !isNaN(paraIdx)) ? paraIdx : null
+  };
+
+  // Posicionar el toolbar — preferentemente ABAJO de la selección para
+  // no solapar con el menú nativo de iOS (que sale arriba por default).
+  const rect = range.getBoundingClientRect();
   const tb = document.getElementById('sel-toolbar');
   tb.style.display = 'flex';
-  tb.style.left    = Math.max(8, rect.left + rect.width / 2 - 60) + 'px';
-  tb.style.top     = (rect.top + window.scrollY - 52) + 'px';
+
+  // Medir el toolbar después de hacerlo visible
+  const tbRect = tb.getBoundingClientRect();
+  const tbW = tbRect.width || 140;
+  const tbH = tbRect.height || 40;
+
+  // Centrar horizontalmente respecto a la selección, dentro del viewport
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left = rect.left + rect.width / 2 - tbW / 2;
+  if (left < 8) left = 8;
+  if (left + tbW > vw - 8) left = vw - 8 - tbW;
+
+  // Vertical: abajo de la selección con margen, salvo que no haya espacio,
+  // en cuyo caso arriba.
+  const SPACE = 14;  // margen para no pegar al texto
+  let top;
+  if (rect.bottom + SPACE + tbH < vh - 8) {
+    // Espacio abajo
+    top = rect.bottom + SPACE;
+  } else if (rect.top - SPACE - tbH > 8) {
+    // No hay espacio abajo, arriba sí
+    top = rect.top - SPACE - tbH;
+  } else {
+    // Última opción: pegado al borde inferior visible
+    top = vh - tbH - 8;
+  }
+
+  tb.style.left = left + 'px';
+  tb.style.top  = top  + 'px';
 }
 
-function hideSel() { document.getElementById('sel-toolbar').style.display = 'none'; }
+function hideSel() {
+  document.getElementById('sel-toolbar').style.display = 'none';
+  pendingHighlight = null;
+}
 
 async function doHighlight() {
-  const sel = window.getSelection();
-  if (!sel || sel.isCollapsed) return;
-  const text = sel.toString().trim();
-  if (!text || !state.currentBookId) return;
+  // Usamos el pendingHighlight capturado por handleSel, NO window.getSelection,
+  // porque en iOS la selección ya se canceló cuando tocaste el botón.
+  if (!pendingHighlight || !state.currentBookId) {
+    hideSel();
+    return;
+  }
+  const { range, text, paraIdx } = pendingHighlight;
+  if (!text) { hideSel(); return; }
 
   try {
-    const range = sel.getRangeAt(0);
-
-    // paraIdx del párrafo donde inicia la selección
-    let pNode = range.startContainer;
-    while (pNode && (pNode.nodeType !== 1 || !pNode.hasAttribute || !pNode.hasAttribute('data-para-idx'))) {
-      pNode = pNode.parentNode;
-    }
-    const paraIdx = pNode && pNode.dataset && pNode.dataset.paraIdx !== undefined
-      ? parseInt(pNode.dataset.paraIdx, 10) : null;
-
     const id = state.nextId++;
     const hl = {
       id, bookId: state.currentBookId,
       text, note: '', color: currentColor, ts: Date.now(),
-      paraIdx: (paraIdx != null && !isNaN(paraIdx)) ? paraIdx : undefined
+      paraIdx: paraIdx != null ? paraIdx : undefined
     };
 
     wrapRange(range, id, currentColor);
     state.highlights.push(hl);
-    sel.removeAllRanges();
+
+    // Limpiar selección si todavía existe
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
 
     await dbPut('highlights', hl);
     await savePref('nextId', state.nextId);

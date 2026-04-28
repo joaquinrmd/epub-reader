@@ -910,26 +910,54 @@ body {
   display: none;
   position: fixed;
   background: #1c1c1c;
-  border-radius: 8px;
-  padding: 6px 8px;
-  gap: 6px;
-  z-index: 9999;
+  border-radius: 10px;
+  padding: 8px 10px;
+  gap: 8px;
+  z-index: 99999;
   align-items: center;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+  /* Evita que iOS quite la selección cuando interactuamos con el toolbar */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  /* Animación suave de entrada */
+  animation: tb-fade-in 0.12s ease-out;
+}
+@keyframes tb-fade-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 #sel-toolbar button {
-  font-size: 12px;
-  padding: 5px 12px;
-  border-radius: 5px;
+  font-size: 14px;
+  padding: 9px 16px;          /* targets táctiles más grandes */
+  border-radius: 7px;
   cursor: pointer;
   font-family: 'DM Sans', sans-serif;
   border: none;
   font-weight: 500;
-  transition: opacity 0.15s;
+  transition: opacity 0.15s, transform 0.05s;
+  min-height: 36px;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  /* Tap highlight transparente — el feedback visual lo manejamos nosotros */
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
-#btn-hl { background: var(--hl-yellow-solid); color: #78350f; }
+#sel-toolbar button:active { transform: scale(0.96); }
+#btn-hl {
+  background: var(--hl-yellow-solid);
+  color: #78350f;
+  min-width: 90px;
+}
 #btn-hl:hover { opacity: 0.85; }
-#btn-cancel-sel { background: transparent; color: #888; font-size: 18px; padding: 2px 6px; }
+#btn-cancel-sel {
+  background: transparent;
+  color: #aaa;
+  font-size: 18px;
+  padding: 6px 10px;
+  min-width: 36px;
+}
 #btn-cancel-sel:hover { color: #fff; }
 
 /* ─── LOADING ─── */
