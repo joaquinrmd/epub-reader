@@ -166,8 +166,7 @@ async function loadState() {
     title: b.title,
     author: b.author || '',
     fileType: b.fileType || 'epub',
-    driveEpubFileId: b.driveEpubFileId || null,
-    hasEpubInDrive: !!b.driveEpubFileId
+    driveEpubFileId: b.driveEpubFileId || null
   }));
   state.highlights = await dbGetAll('highlights');
   const nid = await dbGet('prefs', 'nextId');         state.nextId        = nid ? nid.value : 1;
@@ -277,9 +276,9 @@ function loadGapiScript() {
 }
 
 function initDrive(silent) {
-  if (!window.google) {
+  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
     if (!silent) setStatus('Cargando Google...');
-    setTimeout(() => initDrive(silent), 1500);
+    setTimeout(() => initDrive(silent), 800);
     return;
   }
   tokenClient = google.accounts.oauth2.initTokenClient({
@@ -287,35 +286,90 @@ function initDrive(silent) {
     callback: async resp => {
       if (resp.error) {
         if (!silent) setStatus('Error al conectar Drive');
+        // Si el error es no_session/interaction_required, dejar el flag
+        // de autoconnect — la próxima vez tal vez funcione. Pero si es
+        // access_denied, sí limpiar.
+        if (resp.error === 'access_denied') {
+          savePref('driveAutoconnect', false);
+        }
         return;
       }
       driveReady = true;
+      // Guardar el token con expiración para usarlo si la app se recarga
+      // antes de que expire (Google da tokens de ~1 hora)
+      if (resp.access_token && resp.expires_in) {
+        const expiresAt = Date.now() + (resp.expires_in * 1000) - 30000; // -30s buffer
+        savePref('driveToken', { token: resp.access_token, expiresAt });
+        // Setearlo en gapi también para que las llamadas usen este token
+        if (window.gapi && gapi.client) {
+          gapi.client.setToken({ access_token: resp.access_token });
+        }
+      }
       document.getElementById('drive-btn').textContent = 'Drive conectado';
       document.getElementById('drive-btn').classList.add('connected');
       document.getElementById('drive-dot').classList.add('connected');
       document.getElementById('drive-status-text').textContent = 'Google Drive activo';
-      // Recordar que el usuario conectó Drive — para autoreconectar en próximas sesiones
       savePref('driveAutoconnect', true);
       if (!silent) setStatus('Conectado — sincronizando...');
+      else        setStatus('Drive sincronizando...');
       await syncFromDrive();
     }
   });
-  // En modo silent (autoreconexión al iniciar): prompt vacío = no muestra
-  // ninguna UI si el usuario ya autorizó antes y el token sigue vigente.
-  // Si requiere interacción, falla silenciosamente.
-  // En modo manual (botón presionado): igual prompt vacío, pero si falla
-  // Google muestra la pantalla de consentimiento.
-  tokenClient.requestAccessToken({ prompt: '' });
+  // prompt vacío = sin UI si hay sesión activa de Google. Si no, fallará
+  // silenciosamente con error 'no_session' / 'interaction_required'.
+  tryRequestToken(silent);
 }
 
-/* Llamado al iniciar la app: si el usuario antes había conectado Drive,
-   intenta reconectar sin mostrar UI. */
+function tryRequestToken(silent) {
+  try {
+    tokenClient.requestAccessToken({ prompt: silent ? 'none' : '' });
+  } catch (e) {
+    console.error('[tokenRequest]', e);
+    if (!silent) setStatus('Error pidiendo token');
+  }
+}
+
+/* Intenta autoreconectar al iniciar:
+   1. Si tenemos un token guardado que aún no expiró, usarlo directamente.
+      Esto evita ir a Google completamente — la app abre con Drive listo.
+   2. Si no hay token vigente pero el flag driveAutoconnect está, intentar
+      requestAccessToken({ prompt: 'none' }) — silencioso. */
 async function tryAutoreconnectDrive() {
   const auto = await dbGet('prefs', 'driveAutoconnect').catch(() => null);
-  if (auto && auto.value) {
-    // Esperamos un poco a que cargue google.accounts
-    setTimeout(() => initDrive(true), 2500);
+  if (!auto || !auto.value) return;
+
+  const tokRec = await dbGet('prefs', 'driveToken').catch(() => null);
+  if (tokRec && tokRec.value && tokRec.value.expiresAt > Date.now()) {
+    // Tenemos token vigente — usarlo
+    waitForGapiThen(() => {
+      driveReady = true;
+      gapi.client.setToken({ access_token: tokRec.value.token });
+      document.getElementById('drive-btn').textContent = 'Drive conectado';
+      document.getElementById('drive-btn').classList.add('connected');
+      document.getElementById('drive-dot').classList.add('connected');
+      document.getElementById('drive-status-text').textContent = 'Google Drive activo';
+      setStatus('Drive sincronizando...');
+      syncFromDrive();
+    });
+    return;
   }
+
+  // Sin token vigente — pedir uno nuevo silencioso
+  waitForGapiThen(() => initDrive(true));
+}
+
+/* Espera a que tanto gapi como google.accounts estén listos antes de ejecutar fn. */
+function waitForGapiThen(fn) {
+  let attempts = 0;
+  const check = () => {
+    attempts++;
+    const ok = window.gapi && gapi.client && window.google &&
+               google.accounts && google.accounts.oauth2;
+    if (ok) { fn(); return; }
+    if (attempts > 40) return;  // ~20s de espera total
+    setTimeout(check, 500);
+  };
+  check();
 }
 
 async function syncFromDrive() {
@@ -329,6 +383,9 @@ async function syncFromDrive() {
       driveFileId   = files[0].id;
       const content = await gapi.client.drive.files.get({ fileId: driveFileId, alt: 'media' });
       await mergeState(JSON.parse(content.body));
+      // Reconciliar libros con sus archivos en Drive (busca book-{id}.epub
+      // para libros que no tengan driveEpubFileId cacheado)
+      await reconcileBooksWithDrive();
       renderSidebar(); renderHighlights();
       setStatus('Sincronizado con Drive');
     } else {
@@ -340,8 +397,51 @@ async function syncFromDrive() {
     setStatus('Error sincronizando — datos locales disponibles');
   }
   hideLoading();
-  // Subir libros que estaban pendientes (cargados sin Drive conectado)
-  uploadPendingBooks().catch(e => console.error('[uploadPending]', e));
+}
+
+/* Reconcilia los libros locales con los archivos book-{id}.{epub,txt} que
+   existen en appDataFolder. Esto cubre dos casos:
+   1. Libros viejos subidos antes de que existiera el campo driveEpubFileId.
+   2. Libros donde el upload terminó pero el JSON aún no se guardó (race).
+   Lista una sola vez TODOS los archivos book-* del appDataFolder y los
+   matchea con los libros locales. Mucho más rápido que pedir uno por uno. */
+async function reconcileBooksWithDrive() {
+  if (!driveReady) return;
+  try {
+    const res = await gapi.client.drive.files.list({
+      spaces: 'appDataFolder',
+      q: "name contains 'book-'",
+      fields: 'files(id,name)',
+      pageSize: 500
+    });
+    const files = (res.result.files || []);
+    // Mapear name → id
+    const byName = {};
+    for (const f of files) byName[f.name] = f.id;
+
+    let changed = false;
+    for (const book of state.books) {
+      const ext = book.fileType === 'txt' ? 'txt' : 'epub';
+      const filename = `book-${book.id}.${ext}`;
+      const driveId = byName[filename];
+      if (driveId && book.driveEpubFileId !== driveId) {
+        book.driveEpubFileId = driveId;
+        // Persistir
+        const full = await dbGet('books', book.id);
+        if (full) {
+          full.driveEpubFileId = driveId;
+          await dbPut('books', full);
+        }
+        changed = true;
+      }
+    }
+    if (changed) {
+      // Re-guardar el JSON con los IDs reconciliados
+      saveToDrive();
+    }
+  } catch (e) {
+    console.error('[reconcileBooksWithDrive]', e);
+  }
 }
 
 async function mergeState(remote) {
@@ -352,7 +452,7 @@ async function mergeState(remote) {
   }
   for (const b of (remote.books || [])) {
     if (!bookIds.has(b.id)) {
-      // Libro nuevo (que existe en Drive pero no acá)
+      // Libro nuevo en este dispositivo — viene con driveEpubFileId si está en Drive
       const driveEpubFileId = b.driveEpubFileId || null;
       const fileType = b.fileType || 'epub';
       state.books.push({
@@ -360,29 +460,23 @@ async function mergeState(remote) {
         title: b.title,
         author: b.author || '',
         fileType,
-        driveEpubFileId,
-        hasEpubInDrive: !!driveEpubFileId
+        driveEpubFileId
       });
       await dbPut('books', {
         id: b.id, title: b.title, author: b.author || '',
         chapters: [], coverBase64: null,
         fileType,
-        driveEpubFileId,
-        hasEpubInDrive: !!driveEpubFileId
+        driveEpubFileId
       });
     } else {
       // Libro ya existe localmente — actualizar driveEpubFileId si vino remoto
-      // (caso: este dispositivo subió el libro pero después se reinició y
-      //  perdió el driveEpubFileId, o vino de un dispositivo con info nueva)
       const local = state.books.find(lb => lb.id === b.id);
       if (local && b.driveEpubFileId && !local.driveEpubFileId) {
         local.driveEpubFileId = b.driveEpubFileId;
-        local.hasEpubInDrive = true;
         local.fileType = b.fileType || local.fileType || 'epub';
         const fullLocal = await dbGet('books', b.id);
         if (fullLocal) {
           fullLocal.driveEpubFileId = b.driveEpubFileId;
-          fullLocal.hasEpubInDrive = true;
           fullLocal.fileType = b.fileType || fullLocal.fileType || 'epub';
           await dbPut('books', fullLocal);
         }
@@ -506,17 +600,12 @@ async function uploadBookFileToDrive(bookId, file, fileType) {
 
     const driveId = resp.result.id;
 
-    // Guardar el driveFileId en el record del libro y limpiar el cache pending
+    // Guardar el driveFileId en el record del libro
     const book = state.books.find(b => b.id === bookId);
-    if (book) {
-      book.driveEpubFileId = driveId;
-      book.hasEpubInDrive = true;
-    }
+    if (book) book.driveEpubFileId = driveId;
     const full = await dbGet('books', bookId);
     if (full) {
       full.driveEpubFileId = driveId;
-      full.hasEpubInDrive = true;
-      delete full.pendingDriveUpload;  // ya no necesitamos el ArrayBuffer cacheado
       await dbPut('books', full);
     }
 
@@ -936,24 +1025,13 @@ async function addBook(title, author, chapters, coverBase64, originalFile) {
   const fileType = originalFile && originalFile.name.toLowerCase().endsWith('.epub')
     ? 'epub' : 'txt';
 
-  // Si Drive no está conectado, guardar el archivo original en IndexedDB
-  // temporalmente. Cuando se conecte Drive, lo subimos y borramos del cache.
-  let pendingUpload = null;
-  if (!driveReady && originalFile) {
-    try {
-      pendingUpload = await originalFile.arrayBuffer();
-    } catch (e) { /* ignorar — el libro sigue funcionando local */ }
-  }
-
   await dbPut('books', {
     id, title, author, chapters,
     coverBase64: coverBase64 || null,
     fileType,
-    hasEpubInDrive: false,
-    driveEpubFileId: null,
-    pendingDriveUpload: pendingUpload  // ArrayBuffer crudo, undefined si Drive estaba conectado
+    driveEpubFileId: null
   });
-  state.books.push({ id, title, author, fileType, hasEpubInDrive: false, driveEpubFileId: null });
+  state.books.push({ id, title, author, fileType, driveEpubFileId: null });
   await savePref('nextId', state.nextId);
   await savePref('currentBookId', id);
   saveToDrive();
@@ -961,42 +1039,11 @@ async function addBook(title, author, chapters, coverBase64, originalFile) {
   await selectBook(id);
   setStatus(`"${title}" cargado`);
 
-  // Upload del archivo original a Drive en background (no bloquea)
+  // Si Drive está conectado AHORA, subir en background. Si no, no se sube
+  // — el usuario va a tener que volver a subirlo en otros dispositivos.
   if (driveReady && originalFile) {
     uploadBookFileToDrive(id, originalFile, fileType).catch(e =>
       console.error('[uploadBookFile]', e));
-  }
-}
-
-/* Cuando Drive se conecta, sube los libros que tenían pendingDriveUpload. */
-async function uploadPendingBooks() {
-  if (!driveReady) return;
-  const books = await dbGetAll('books');
-  for (const b of books) {
-    if (!b.pendingDriveUpload) continue;
-    if (b.driveEpubFileId) {
-      // Ya subido — limpiar el pending
-      delete b.pendingDriveUpload;
-      await dbPut('books', b);
-      continue;
-    }
-    try {
-      const blob = new Blob([b.pendingDriveUpload], {
-        type: b.fileType === 'epub' ? 'application/epub+zip' : 'text/plain'
-      });
-      const fakeName = b.title.replace(/[^\w\s.-]/g, '_') +
-                       (b.fileType === 'epub' ? '.epub' : '.txt');
-      const file = new File([blob], fakeName, { type: blob.type });
-      await uploadBookFileToDrive(b.id, file, b.fileType || 'epub');
-      // Borrar el pending del DB
-      const updated = await dbGet('books', b.id);
-      if (updated) {
-        delete updated.pendingDriveUpload;
-        await dbPut('books', updated);
-      }
-    } catch (e) {
-      console.error('[uploadPendingBooks]', b.id, e);
-    }
   }
 }
 
@@ -1029,16 +1076,39 @@ async function selectBook(id) {
       await openBook({
         chapters: [{ index: 0, title: null, html: full.html, filename: '' }]
       });
-    } else if (full && full.driveEpubFileId && driveReady) {
-      // No hay contenido local pero sí en Drive — ofrecer descargar
+    } else if (driveReady) {
+      // No hay contenido local. Si Drive está conectado, intentar buscar el
+      // archivo en Drive — incluso si driveEpubFileId no está cacheado, puede
+      // existir como book-{id}.epub (libros viejos subidos antes de que el
+      // campo existiera).
       hideLoading();
-      mountEmptyBook('Este libro está en Drive pero no en este dispositivo.<br><br>' +
-                     `<button onclick="downloadBookFromDrive(${id})" ` +
-                     'style="padding:10px 18px;border-radius:8px;background:var(--accent);' +
-                     'color:#fff;border:none;cursor:pointer;font-family:inherit;' +
-                     'font-size:13px;font-weight:500;pointer-events:auto;">' +
-                     'Descargar desde Drive</button>');
-      // pointer-events:auto en el botón porque el padre tiene pointer-events:none
+      let driveId = full && full.driveEpubFileId;
+      if (!driveId) {
+        // Intentar localizarlo por nombre
+        showLoading('Buscando en Drive...');
+        driveId = await findBookInDrive(id, (full && full.fileType) || 'epub');
+        hideLoading();
+        if (driveId && full) {
+          // Cachear el ID encontrado
+          full.driveEpubFileId = driveId;
+          await dbPut('books', full);
+          const local = state.books.find(b => b.id === id);
+          if (local) local.driveEpubFileId = driveId;
+          saveToDrive();
+        }
+      }
+      if (driveId) {
+        mountEmptyBook('Este libro está en Drive pero no en este dispositivo.<br><br>' +
+                       `<button onclick="downloadBookFromDrive(${id})" ` +
+                       'style="padding:10px 18px;border-radius:8px;background:var(--accent);' +
+                       'color:#fff;border:none;cursor:pointer;font-family:inherit;' +
+                       'font-size:13px;font-weight:500;pointer-events:auto;">' +
+                       'Descargar desde Drive</button>');
+      } else {
+        mountEmptyBook('Este libro no tiene contenido en este dispositivo ni en Drive.<br>Volvé a subir el EPUB para leerlo aquí.');
+      }
+      renderHighlights();
+      renderLibrary();
       return;
     } else if (full && full.driveEpubFileId && !driveReady) {
       mountEmptyBook('Este libro está en Drive. Conectá Drive para descargarlo.');
@@ -1051,6 +1121,26 @@ async function selectBook(id) {
   }
   hideLoading();
   renderHighlights();
+}
+
+/* Busca book-{id}.{epub|txt} en appDataFolder. Devuelve el driveFileId o null. */
+async function findBookInDrive(bookId, fileType) {
+  if (!driveReady) return null;
+  try {
+    const ext = fileType === 'txt' ? 'txt' : 'epub';
+    const filename = `book-${bookId}.${ext}`;
+    const res = await gapi.client.drive.files.list({
+      spaces: 'appDataFolder',
+      q: `name='${filename}'`,
+      fields: 'files(id,name)'
+    });
+    const files = res.result.files;
+    if (files && files.length > 0) return files[0].id;
+    return null;
+  } catch (e) {
+    console.error('[findBookInDrive]', e);
+    return null;
+  }
 }
 
 async function openBook(fullBook) {
