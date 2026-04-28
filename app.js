@@ -532,75 +532,125 @@ async function saveToDrive() {
 // ════════════════════════════════════════════════════════════════
 
 /* Sube el archivo original (EPUB o TXT) a Drive como book-{id}.epub
-   o book-{id}.txt en appDataFolder. Si ya existe (por ejemplo en otro
-   dispositivo), lo reemplaza.
+   o book-{id}.txt en appDataFolder.
 
-   Usa upload multipart porque tenemos metadata + bytes. Para archivos
-   grandes podríamos usar resumable, pero EPUBs típicos son <10MB
-   y multipart es más simple. */
+   Estrategia (la que sí funciona, después del intento fallido con
+   multipart base64): dos requests con fetch directo.
+   1. POST /drive/v3/files con metadata → crea el archivo "vacío" y
+      devuelve un ID. Si ya existe, hacemos PATCH al existente.
+   2. PATCH /upload/drive/v3/files/{id}?uploadType=media con el blob
+      crudo en el body. Esto sube los bytes reales sin base64 ni
+      multipart.
+
+   Verifica con HEAD/GET el tamaño después para confirmar que el
+   upload realmente llegó (en lugar de mostrar "✓" engañoso). */
 async function uploadBookFileToDrive(bookId, file, fileType) {
   if (!driveReady) return;
 
   const ind = document.getElementById('sync-indicator');
   if (ind) ind.textContent = 'Subiendo...';
 
+  // Helper para conseguir el access token (lo necesitamos para fetch directo)
+  const getToken = () => {
+    if (window.gapi && gapi.client) {
+      const t = gapi.client.getToken();
+      if (t && t.access_token) return t.access_token;
+    }
+    return null;
+  };
+  const token = getToken();
+  if (!token) {
+    console.error('[upload] sin access_token');
+    if (ind) ind.textContent = 'Error: sin token';
+    return;
+  }
+
   try {
     const ext = fileType === 'txt' ? 'txt' : 'epub';
     const filename = `book-${bookId}.${ext}`;
+    const contentType = ext === 'epub' ? 'application/epub+zip' : 'text/plain';
+    const fileSize = file.size;
 
-    // Buscar si ya existe (al re-subir el mismo libro)
+    // 1. ¿Ya existe este archivo en Drive? Si sí, lo reemplazamos.
     let existingId = null;
     try {
-      const existing = await gapi.client.drive.files.list({
-        spaces: 'appDataFolder',
-        q: `name='${filename}'`,
-        fields: 'files(id,name)'
-      });
-      if (existing.result.files && existing.result.files.length > 0) {
-        existingId = existing.result.files[0].id;
+      const listResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name='" + filename + "'")}&fields=files(id,name)`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (listResp.ok) {
+        const data = await listResp.json();
+        if (data.files && data.files.length > 0) {
+          existingId = data.files[0].id;
+        }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn('[upload] list falló', e);
+    }
 
-    // Leer el archivo como ArrayBuffer
-    const arrayBuf = await file.arrayBuffer();
-    // Convertir a base64 para multipart upload
-    const base64 = arrayBufferToBase64(arrayBuf);
+    let driveId = existingId;
 
-    const boundary = '-------milector' + Date.now();
-    const delimiter = `\r\n--${boundary}\r\n`;
-    const closeDelim = `\r\n--${boundary}--`;
-    const contentType = ext === 'epub' ? 'application/epub+zip' : 'text/plain';
+    // 2. Si no existe, crear el archivo (metadata only, content vacío)
+    if (!driveId) {
+      const createResp = await fetch(
+        'https://www.googleapis.com/drive/v3/files',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name: filename,
+            parents: ['appDataFolder'],
+            mimeType: contentType
+          })
+        }
+      );
+      if (!createResp.ok) {
+        const txt = await createResp.text().catch(() => '');
+        throw new Error(`create falló: ${createResp.status} — ${txt}`);
+      }
+      const meta = await createResp.json();
+      driveId = meta.id;
+    }
 
-    const metadata = existingId
-      ? {} // PATCH no requiere parents/name
-      : { name: filename, parents: ['appDataFolder'] };
+    // 3. Subir los bytes con uploadType=media (PATCH al archivo)
+    const blob = file instanceof Blob ? file : new Blob([await file.arrayBuffer()]);
+    const uploadResp = await fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${driveId}?uploadType=media`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': contentType
+        },
+        body: blob
+      }
+    );
+    if (!uploadResp.ok) {
+      const txt = await uploadResp.text().catch(() => '');
+      throw new Error(`upload de bytes falló: ${uploadResp.status} — ${txt}`);
+    }
 
-    const body =
-      delimiter +
-      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-      JSON.stringify(metadata) +
-      delimiter +
-      `Content-Type: ${contentType}\r\n` +
-      'Content-Transfer-Encoding: base64\r\n\r\n' +
-      base64 +
-      closeDelim;
+    // 4. VERIFICAR — pedir el size del archivo recién subido y compararlo
+    //    con el local. Si difiere, hubo un problema y no marcamos éxito.
+    const verifyResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${driveId}?fields=id,size,name`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!verifyResp.ok) {
+      throw new Error('verificación falló: ' + verifyResp.status);
+    }
+    const verifyData = await verifyResp.json();
+    const remoteSize = parseInt(verifyData.size, 10);
+    if (isNaN(remoteSize) || Math.abs(remoteSize - fileSize) > 100) {
+      throw new Error(`tamaño no coincide: local=${fileSize} drive=${remoteSize}`);
+    }
 
-    const path = existingId
-      ? `/upload/drive/v3/files/${existingId}`
-      : '/upload/drive/v3/files';
-    const method = existingId ? 'PATCH' : 'POST';
+    console.log(`[upload] ${filename} OK — ${fileSize} bytes en Drive`);
 
-    const resp = await gapi.client.request({
-      path,
-      method,
-      params: { uploadType: 'multipart', fields: 'id' },
-      headers: { 'Content-Type': `multipart/related; boundary="${boundary}"` },
-      body
-    });
-
-    const driveId = resp.result.id;
-
-    // Guardar el driveFileId en el record del libro
+    // 5. Guardar el driveFileId en el record del libro
     const book = state.books.find(b => b.id === bookId);
     if (book) book.driveEpubFileId = driveId;
     const full = await dbGet('books', bookId);
@@ -609,21 +659,34 @@ async function uploadBookFileToDrive(bookId, file, fileType) {
       await dbPut('books', full);
     }
 
-    // Actualizar el JSON de Drive con el nuevo driveEpubFileId
+    // 6. Actualizar el JSON de Drive con el nuevo driveEpubFileId
     saveToDrive();
 
     if (ind) {
-      ind.textContent = 'Subido a Drive ✓';
-      setTimeout(() => { ind.textContent = ''; }, 2500);
+      ind.textContent = `Subido a Drive ✓ (${formatBytes(fileSize)})`;
+      setTimeout(() => { ind.textContent = ''; }, 3500);
     }
   } catch (e) {
     console.error('[uploadBookFileToDrive]', e);
-    if (ind) ind.textContent = 'Error subiendo';
+    if (ind) {
+      ind.textContent = 'Error subiendo: ' + (e.message || 'desconocido').substring(0, 50);
+      setTimeout(() => { ind.textContent = ''; }, 5000);
+    }
+    setStatus('Error al subir el libro a Drive — revisá la consola');
   }
 }
 
+/* Helper de formato de bytes para mostrar al usuario */
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
 /* Baja el EPUB de un libro desde Drive y lo procesa con el parser
-   existente. Devuelve true si tuvo éxito. */
+   existente. Usa fetch directo para garantizar que los bytes binarios
+   lleguen sin corromperse (gapi.client.request los devolvía como string,
+   eso era frágil). */
 async function downloadBookFromDrive(bookId) {
   if (!driveReady) {
     setStatus('Conectá Drive primero');
@@ -646,29 +709,30 @@ async function downloadBookFromDrive(bookId) {
   showLoading('Descargando "' + (book ? book.title : 'libro') + '" desde Drive...');
 
   try {
-    // Descargar el archivo binario
-    const resp = await gapi.client.drive.files.get({
-      fileId: driveId,
-      alt: 'media'
-    });
-    // gapi devuelve `body` como string (las bytes raw como string).
-    // Lo convertimos a Uint8Array.
-    const bodyStr = resp.body;
-    const bytes = new Uint8Array(bodyStr.length);
-    for (let i = 0; i < bodyStr.length; i++) {
-      bytes[i] = bodyStr.charCodeAt(i) & 0xff;
-    }
+    const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                   gapi.client.getToken().access_token);
+    if (!token) throw new Error('sin access_token');
 
-    // Crear un File-like para reusar el parser
-    const blob = new Blob([bytes], {
+    // Descargar con fetch — alt=media devuelve los bytes crudos
+    const resp = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${driveId}?alt=media`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`download falló: ${resp.status} — ${txt}`);
+    }
+    // Bytes binarios crudos
+    const arrayBuf = await resp.arrayBuffer();
+    console.log(`[download] ${driveId} OK — ${arrayBuf.byteLength} bytes`);
+
+    const blob = new Blob([arrayBuf], {
       type: fileType === 'epub' ? 'application/epub+zip' : 'text/plain'
     });
     const fakeName = (book ? book.title : 'libro').replace(/[^\w\s.-]/g, '_') +
                      (fileType === 'epub' ? '.epub' : '.txt');
     const fakeFile = new File([blob], fakeName, { type: blob.type });
 
-    // Parsear y reemplazar el contenido del libro existente.
-    // Usamos un flag para que NO se cree un libro nuevo: vamos a sobrescribir.
     if (fileType === 'epub') {
       await parseAndReplaceBookContent(bookId, fakeFile);
     } else {
@@ -684,7 +748,6 @@ async function downloadBookFromDrive(bookId) {
 
     hideLoading();
     setStatus('Libro descargado');
-    // Si es el libro actual, recargarlo
     if (state.currentBookId === bookId) {
       await selectBook(bookId);
     } else {
@@ -694,7 +757,7 @@ async function downloadBookFromDrive(bookId) {
   } catch (e) {
     console.error('[downloadBookFromDrive]', e);
     hideLoading();
-    setStatus('Error al descargar — intentá de nuevo');
+    setStatus('Error al descargar: ' + (e.message || 'desconocido').substring(0, 60));
     return false;
   }
 }
@@ -794,22 +857,17 @@ async function parseAndReplaceBookContent(bookId, file) {
 /* Borra el archivo EPUB de Drive cuando se borra el libro localmente. */
 async function deleteBookFromDrive(driveId) {
   if (!driveReady || !driveId) return;
+  const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                 gapi.client.getToken().access_token);
+  if (!token) return;
   try {
-    await gapi.client.drive.files.delete({ fileId: driveId });
+    await fetch(`https://www.googleapis.com/drive/v3/files/${driveId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` }
+    });
   } catch (e) {
     console.error('[deleteBookFromDrive]', e);
   }
-}
-
-/* Helper para convertir ArrayBuffer a base64 (necesario para multipart upload). */
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
 }
 
 // ════════════════════════════════════════════════════════════════
