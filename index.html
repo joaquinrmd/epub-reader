@@ -60,6 +60,7 @@
         <button class="btn-font" id="btn-font-plus"  onclick="changeFontSize(+1)" title="Más grande">A+</button>
       </div>
       <button id="btn-theme" onclick="cycleTheme()" title="Cambiar tema">☀</button>
+      <button id="btn-search" onclick="toggleSearch()" title="Buscar en el libro (Ctrl+F)">🔍</button>
       <div class="header-sep"></div>
       <div id="tabs">
         <button class="tab active" onclick="showTab('reader')">Leer</button>
@@ -77,6 +78,15 @@
     <div class="color-dot"        id="color-pink"   onclick="setColor('pink')"   title="Rosa"></div>
     <div style="flex:1;"></div>
     <button id="btn-bookmark" onclick="addBookmark()" title="Marcar esta posición">🔖 Marcar</button>
+  </div>
+
+  <!-- BARRA DE BÚSQUEDA (oculta por defecto) -->
+  <div id="search-bar" style="display:none;">
+    <input type="text" id="search-input" placeholder="Buscar en el libro..." autocomplete="off" spellcheck="false">
+    <span id="search-counter">0 resultados</span>
+    <button id="btn-search-prev" onclick="searchPrev()" title="Anterior" disabled>↑</button>
+    <button id="btn-search-next" onclick="searchNext()" title="Siguiente" disabled>↓</button>
+    <button id="btn-search-close" onclick="closeSearch()" title="Cerrar (Esc)">✕</button>
   </div>
 
   <div id="content">

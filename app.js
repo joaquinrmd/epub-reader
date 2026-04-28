@@ -123,6 +123,7 @@ window.addEventListener('load', async () => {
     setupReaderScroll();
     setupSelectionHandlers();
     setupKeyboard();
+    setupSearch();
     if (state.currentBookId) await selectBook(state.currentBookId);
     renderHighlights();
   } catch (e) {
@@ -591,6 +592,9 @@ async function selectBook(id) {
   await savePref('currentBookId', id);
   const book = state.books.find(b => b.id === id);
   if (!book) return;
+
+  // Cerrar buscador si estaba abierto (los matches eran del libro anterior)
+  if (search.open) closeSearch();
 
   document.getElementById('book-title-display').textContent =
     book.title + (book.author ? ' — ' + book.author : '');
@@ -1288,8 +1292,346 @@ async function renderLibrary() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  UI — TABS
+//  BÚSQUEDA DENTRO DEL LIBRO
 // ════════════════════════════════════════════════════════════════
+
+/* Estado del buscador. Los matches se almacenan como
+   { paraIdx, start, end } — start y end son offsets dentro del
+   textContent del párrafo. Eso nos permite encontrar el rango
+   exacto en el DOM cuando navegamos a un match. */
+const search = {
+  query: '',
+  matches: [],
+  currentIdx: -1,
+  open: false,
+  searchToken: 0,    // identifier para cancelar búsquedas en curso
+  debounceTimer: 0
+};
+
+/* Normaliza para búsqueda case-insensitive y sin acentos.
+   "fácil" → "facil", "Niño" → "nino". */
+function normalizeForSearch(s) {
+  if (!s) return '';
+  return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function toggleSearch() {
+  if (search.open) closeSearch();
+  else             openSearch();
+}
+
+function openSearch() {
+  if (!allParagraphs.length) {
+    setStatus('Primero abrí un libro');
+    return;
+  }
+  search.open = true;
+  document.getElementById('search-bar').style.display = 'flex';
+  document.getElementById('btn-search').classList.add('active');
+  // Asegurar que estamos en la pestaña Leer (sino no se ve)
+  if (currentTab !== 'reader') showTab('reader');
+  const input = document.getElementById('search-input');
+  input.focus();
+  input.select();
+}
+
+function closeSearch() {
+  search.open = false;
+  document.getElementById('search-bar').style.display = 'none';
+  document.getElementById('btn-search').classList.remove('active');
+  clearSearchHighlights();
+  search.query = '';
+  search.matches = [];
+  search.currentIdx = -1;
+  document.getElementById('search-input').value = '';
+  updateSearchCounter();
+}
+
+/* Búsqueda en chunks con requestIdleCallback — para no trabar el UI
+   en libros grandes. Cada chunk procesa N párrafos. */
+async function performSearch(query) {
+  // Cancelar búsqueda anterior si la hay
+  search.searchToken++;
+  const myToken = search.searchToken;
+
+  search.query = query;
+  search.matches = [];
+  search.currentIdx = -1;
+
+  if (!query || query.length < 2) {
+    clearSearchHighlights();
+    updateSearchCounter();
+    return;
+  }
+
+  const needle = normalizeForSearch(query);
+  const total = allParagraphs.length;
+
+  // Pre-calcular textContent normalizado de cada párrafo en chunks.
+  // Procesamos 200 párrafos por idle callback.
+  const CHUNK = 200;
+  let i = 0;
+
+  const processChunk = (deadline) => {
+    if (myToken !== search.searchToken) return;  // cancelada
+    const limit = Math.min(i + CHUNK, total);
+    for (; i < limit; i++) {
+      const para = allParagraphs[i];
+      // Sacar el texto plano del HTML del párrafo
+      const tmp = document.createElement('div');
+      tmp.innerHTML = para.html;
+      const plainText = tmp.textContent || '';
+      const normText  = normalizeForSearch(plainText);
+      let pos = 0;
+      while (true) {
+        const found = normText.indexOf(needle, pos);
+        if (found === -1) break;
+        search.matches.push({ paraIdx: i, start: found, end: found + needle.length });
+        pos = found + needle.length;
+      }
+    }
+    if (i < total) {
+      // Más chunks pendientes
+      if ('requestIdleCallback' in window) {
+        requestIdleCallback(processChunk, { timeout: 100 });
+      } else {
+        setTimeout(() => processChunk(null), 0);
+      }
+      // Mientras tanto, ya podemos ir mostrando el conteo parcial
+      updateSearchCounter(true);
+    } else {
+      // Búsqueda completa
+      finishSearch();
+    }
+  };
+
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(processChunk, { timeout: 100 });
+  } else {
+    setTimeout(() => processChunk(null), 0);
+  }
+}
+
+function finishSearch() {
+  applySearchHighlights();
+  if (search.matches.length > 0) {
+    search.currentIdx = 0;
+    scrollToCurrentMatch();
+  }
+  updateSearchCounter();
+}
+
+/* Aplica los resaltados temporales en el DOM. Importante: hacemos
+   esto por párrafo, modificando solo los párrafos que tienen matches.
+   Los highlights permanentes (.hl) se preservan. */
+function applySearchHighlights() {
+  clearSearchHighlights();
+  const container = document.getElementById('page-content');
+  if (!container || !search.matches.length) return;
+
+  // Agrupar matches por párrafo
+  const byPara = {};
+  for (let mi = 0; mi < search.matches.length; mi++) {
+    const m = search.matches[mi];
+    if (!byPara[m.paraIdx]) byPara[m.paraIdx] = [];
+    byPara[m.paraIdx].push({ ...m, globalIdx: mi });
+  }
+
+  for (const paraIdx in byPara) {
+    const paraEl = container.querySelector(`[data-para-idx="${paraIdx}"]`);
+    if (!paraEl) continue;
+    wrapMatchesInElement(paraEl, byPara[paraIdx]);
+  }
+}
+
+/* Envuelve los matches dentro de un párrafo. Recorre nodos de texto y
+   convierte los rangos [start, end] (offsets en el texto plano) en
+   <span class="search-match"> en el DOM. Los offsets se calculan sobre
+   el texto NORMALIZADO; pero `slice` sobre texto raw funciona igual
+   porque normalize() preserva el largo en caracteres comunes (las
+   tildes son combining diacritics que se quitan con NFD pero luego
+   restamos al normalizar). Ojo: para evitar drift, usamos un mapping
+   entre raw y normalized usando la misma técnica de cada nodo. */
+function wrapMatchesInElement(paraEl, matches) {
+  // Recorrer nodos de texto, manteniendo un offset acumulado de "texto plano"
+  const nodes = [];
+  const walker = document.createTreeWalker(paraEl, NodeFilter.SHOW_TEXT, {
+    acceptNode: n => {
+      // Saltar nodos dentro de highlights permanentes (.hl) o ya marcados (.search-match)
+      let p = n.parentElement;
+      while (p && p !== paraEl) {
+        if (p.classList && (p.classList.contains('search-match'))) return NodeFilter.FILTER_REJECT;
+        p = p.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+
+  // Calcular el offset acumulado normalizado de cada nodo
+  // (necesario porque normalize() puede cambiar el largo en algunos casos
+  // raros de Unicode — usamos length normalizada para los offsets)
+  let acc = 0;
+  const nodeRanges = [];
+  for (const node of nodes) {
+    const norm = normalizeForSearch(node.textContent);
+    nodeRanges.push({ node, accStart: acc, accEnd: acc + norm.length, normLen: norm.length, rawLen: node.textContent.length });
+    acc += norm.length;
+  }
+
+  // Para cada match, encontrar los nodos que toca y crear los spans.
+  // Procesar de atrás hacia adelante para no invalidar offsets al modificar.
+  const sortedMatches = matches.slice().sort((a, b) => b.start - a.start);
+  for (const m of sortedMatches) {
+    wrapSingleMatch(nodeRanges, m);
+  }
+}
+
+function wrapSingleMatch(nodeRanges, match) {
+  // Encontrar el nodo donde empieza y donde termina el match
+  let startNodeInfo = null, endNodeInfo = null;
+  for (const info of nodeRanges) {
+    if (startNodeInfo === null && match.start >= info.accStart && match.start < info.accEnd) {
+      startNodeInfo = info;
+    }
+    if (match.end > info.accStart && match.end <= info.accEnd) {
+      endNodeInfo = info;
+    }
+  }
+  if (!startNodeInfo || !endNodeInfo) return;
+
+  // Si el match cruza nodos (raro, ej. <em>texto</em> en medio), lo saltamos.
+  // Es un trade-off: la mayoría de matches están dentro de un solo nodo de texto.
+  if (startNodeInfo !== endNodeInfo) return;
+
+  // Offsets relativos al nodo
+  const localStart = match.start - startNodeInfo.accStart;
+  const localEnd   = match.end   - startNodeInfo.accStart;
+
+  // Asumimos que el largo raw == largo normalizado. Eso es cierto para
+  // texto en español (las tildes en NFD se eliminan en normalize, pero
+  // el texto raw es NFC normalmente, y `length` en JS es UTF-16 codeunits).
+  // Para un buscador tipo Ctrl+F esto es suficientemente preciso.
+  const node = startNodeInfo.node;
+  const rawText = node.textContent;
+  // Si los largos no coinciden exactamente, los offsets pueden estar
+  // un poco corridos — usamos clamping para que no rompa.
+  const start = Math.min(localStart, rawText.length);
+  const end   = Math.min(localEnd,   rawText.length);
+  if (start >= end) return;
+
+  try {
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    const span = document.createElement('span');
+    span.className = 'search-match';
+    span.dataset.matchIdx = match.globalIdx;
+    range.surroundContents(span);
+  } catch (e) { /* surroundContents falla si el rango cruza tags inline */ }
+}
+
+function clearSearchHighlights() {
+  const container = document.getElementById('page-content');
+  if (!container) return;
+  container.querySelectorAll('.search-match').forEach(span => {
+    const parent = span.parentNode;
+    while (span.firstChild) parent.insertBefore(span.firstChild, span);
+    parent.removeChild(span);
+    parent.normalize();  // unifica nodos de texto adyacentes
+  });
+}
+
+function updateSearchCounter(partial) {
+  const counter = document.getElementById('search-counter');
+  const prevBtn = document.getElementById('btn-search-prev');
+  const nextBtn = document.getElementById('btn-search-next');
+  const n = search.matches.length;
+  if (n === 0) {
+    counter.textContent = search.query ? 'Sin resultados' : '0 resultados';
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+  } else {
+    const cur = search.currentIdx >= 0 ? search.currentIdx + 1 : 0;
+    counter.textContent = partial
+      ? `${n}+ resultados...`
+      : `${cur} de ${n}`;
+    prevBtn.disabled = false;
+    nextBtn.disabled = false;
+  }
+}
+
+function scrollToCurrentMatch() {
+  // Quitar marca de "current" del anterior
+  const container = document.getElementById('page-content');
+  container.querySelectorAll('.search-match-current').forEach(el =>
+    el.classList.remove('search-match-current'));
+
+  if (search.currentIdx < 0 || search.currentIdx >= search.matches.length) return;
+
+  const match = search.matches[search.currentIdx];
+  // Buscar el span correspondiente
+  const span = container.querySelector(`.search-match[data-match-idx="${search.currentIdx}"]`);
+  if (span) {
+    span.classList.add('search-match-current');
+    // scrollIntoView con block:'center' para que quede en el medio del viewport
+    span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  } else {
+    // Fallback: scroll al párrafo
+    scrollToParaIdx(match.paraIdx);
+  }
+  updateSearchCounter();
+}
+
+function searchNext() {
+  if (!search.matches.length) return;
+  search.currentIdx = (search.currentIdx + 1) % search.matches.length;
+  scrollToCurrentMatch();
+}
+
+function searchPrev() {
+  if (!search.matches.length) return;
+  search.currentIdx = (search.currentIdx - 1 + search.matches.length) % search.matches.length;
+  scrollToCurrentMatch();
+}
+
+/* Setup de listeners del buscador. Lo llamamos al final del init. */
+function setupSearch() {
+  const input = document.getElementById('search-input');
+  if (!input) return;
+
+  // Input con debounce de 200ms
+  input.addEventListener('input', e => {
+    const val = e.target.value;
+    clearTimeout(search.debounceTimer);
+    search.debounceTimer = setTimeout(() => performSearch(val), 200);
+  });
+
+  // Enter = next, Shift+Enter = prev, Esc = cerrar
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) searchPrev(); else searchNext();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSearch();
+    }
+  });
+
+  // Ctrl+F / Cmd+F a nivel global → abre/enfoca buscador
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault();
+      openSearch();
+    } else if (e.key === 'Escape' && search.open) {
+      e.preventDefault();
+      closeSearch();
+    }
+  });
+}
+
+
 
 function showTab(tab) {
   currentTab = tab;

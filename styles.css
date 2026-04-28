@@ -291,6 +291,20 @@ body {
 }
 #btn-theme:hover { border-color: var(--accent); }
 
+#btn-search {
+  font-size: 14px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  transition: all 0.15s;
+  line-height: 1;
+}
+#btn-search:hover     { border-color: var(--accent); }
+#btn-search.active    { border-color: var(--accent); background: var(--accent-light); }
+[data-theme="night"] #btn-search.active { background: #2d2219; }
+
 .header-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
 
 #tabs {
@@ -354,6 +368,67 @@ body {
   white-space: nowrap;
 }
 #btn-bookmark:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ─── BARRA DE BÚSQUEDA ─── */
+#search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+#search-input {
+  flex: 1;
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  outline: none;
+  transition: border-color 0.15s;
+  min-width: 0;
+}
+#search-input:focus { border-color: var(--accent); }
+#search-input::placeholder { color: var(--muted); }
+#search-counter {
+  font-size: 11px;
+  color: var(--muted);
+  flex-shrink: 0;
+  min-width: 80px;
+  text-align: right;
+}
+#search-bar button {
+  font-size: 13px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-light);
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: 'DM Sans', sans-serif;
+  flex-shrink: 0;
+  line-height: 1.2;
+}
+#search-bar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+#search-bar button:disabled { opacity: 0.35; cursor: default; }
+
+/* Resaltado de matches de búsqueda — color naranja-acento, distinto a los highlights */
+.search-match {
+  background: rgba(200, 149, 108, 0.30);  /* var(--accent) con alpha */
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.search-match.search-match-current {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 500;
+}
+[data-theme="night"] .search-match { background: rgba(200, 149, 108, 0.40); }
 
 #content {
   flex: 1;
