@@ -22,7 +22,8 @@
 'use strict';
 
 const CLIENT_ID   = '602238897882-g752d4mbev0d2leg8fvnq7lqt6jsof8l.apps.googleusercontent.com';
-const SCOPES      = 'https://www.googleapis.com/auth/drive.appdata';
+const SCOPES      = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/drive.file';
+const INBOX_FOLDER_NAME = 'Lector-Inbox';
 const DRIVE_FILE  = 'mi-lector-data.json';
 const DB_NAME     = 'mi-lector-db';
 const DB_VERSION  = 2;
@@ -301,7 +302,7 @@ function initDrive(silent) {
       // antes de que expire (Google da tokens de ~1 hora)
       if (resp.access_token && resp.expires_in) {
         const expiresAt = Date.now() + (resp.expires_in * 1000) - 30000; // -30s buffer
-        savePref('driveToken', { token: resp.access_token, expiresAt });
+        savePref('driveToken', { token: resp.access_token, expiresAt, scope: SCOPES });
         // Setearlo en gapi también para que las llamadas usen este token
         if (window.gapi && gapi.client) {
           gapi.client.setToken({ access_token: resp.access_token });
@@ -355,8 +356,11 @@ async function tryAutoreconnectDrive() {
   if (!auto || !auto.value) return;
 
   const tokRec = await dbGet('prefs', 'driveToken').catch(() => null);
-  if (tokRec && tokRec.value && tokRec.value.expiresAt > Date.now()) {
-    // Tenemos token vigente — usarlo
+  // Si el scope cambió desde la última vez, el token guardado no sirve —
+  // ignorarlo para forzar reautorización con el scope nuevo.
+  const tokenScopeMatches = tokRec && tokRec.value && tokRec.value.scope === SCOPES;
+  if (tokRec && tokRec.value && tokRec.value.expiresAt > Date.now() && tokenScopeMatches) {
+    // Tenemos token vigente con el scope correcto — usarlo
     waitForGapiThen(() => {
       gapi.client.setToken({ access_token: tokRec.value.token });
       markDriveAsConnected();
@@ -366,7 +370,7 @@ async function tryAutoreconnectDrive() {
     return;
   }
 
-  // Sin token vigente — pedir uno nuevo silencioso
+  // Sin token vigente, o scope cambió — pedir uno nuevo silencioso
   waitForGapiThen(() => initDrive(true));
 }
 
@@ -1366,6 +1370,10 @@ async function selectBook(id) {
   // Cerrar buscador si estaba abierto (los matches eran del libro anterior)
   if (search.open) closeSearch();
 
+  // Limpiar modo selección de export (los IDs eran del libro anterior)
+  exportSelection.active = false;
+  exportSelection.selected.clear();
+
   document.getElementById('book-title-display').textContent =
     book.title + (book.author ? ' — ' + book.author : '');
 
@@ -2099,6 +2107,7 @@ function renderHighlights() {
   const bhs = state.highlights.filter(h => h.bookId === state.currentBookId);
   if (!bhs.length) {
     list.innerHTML = `<div class="empty-state"><strong>Sin subrayados aún</strong>Ve a Leer, seleccioná texto y presioná Subrayar</div>`;
+    updateExportButton();
     return;
   }
   const cs = { yellow:'#ca8a04', blue:'#2563eb', green:'#16a34a', pink:'#db2777' };
@@ -2108,11 +2117,26 @@ function renderHighlights() {
     green:'rgba(134,239,172,0.35)',
     pink:'rgba(249,168,212,0.35)'
   };
-  bhs.sort((a, b) => a.ts - b.ts).forEach(h => {
+
+  bhs.sort((a, b) => {
+    // Si hay paraIdx, ordenar por orden en el libro
+    const pa = a.paraIdx != null ? a.paraIdx : 999999;
+    const pb = b.paraIdx != null ? b.paraIdx : 999999;
+    if (pa !== pb) return pa - pb;
+    return (a.ts || 0) - (b.ts || 0);
+  }).forEach(h => {
     const card = document.createElement('div');
-    card.className = 'hl-card';
+    card.className = 'hl-card' + (exportSelection.active ? ' selectable' : '') +
+                     (exportSelection.selected.has(h.id) ? ' selected' : '');
+    const isChecked = exportSelection.selected.has(h.id);
+
+    const checkboxHtml = exportSelection.active
+      ? `<input type="checkbox" class="hl-checkbox" data-id="${h.id}" ${isChecked ? 'checked' : ''}>`
+      : '';
+
     card.innerHTML = `
       <div class="hl-card-inner">
+        ${checkboxHtml}
         <div class="hl-strip" style="background:${cs[h.color]||cs.yellow};"></div>
         <div class="hl-card-body">
           <div class="hl-text" style="background:${cb[h.color]||cb.yellow};">${escHtml(h.text)}</div>
@@ -2124,11 +2148,16 @@ function renderHighlights() {
       </div>`;
     list.appendChild(card);
   });
+
+  // Listeners
   list.querySelectorAll('.hl-note').forEach(inp => {
     inp.addEventListener('change', async e => {
       const h = state.highlights.find(h => h.id === parseInt(e.target.dataset.id, 10));
       if (h) {
         h.note = e.target.value;
+        // Cuando se edita la nota, hay que volver a marcarlo como NO sincronizado
+        // (sino el saveToDrive futuro NO lo subiría con la nota actualizada).
+        // Truco: forzar un saveToDrive ahora.
         await dbPut('highlights', h);
         saveToDrive();
         setStatus('Nota guardada');
@@ -2137,6 +2166,34 @@ function renderHighlights() {
   });
   list.querySelectorAll('.hl-delete').forEach(btn =>
     btn.addEventListener('click', e => deleteHighlight(parseInt(e.target.dataset.id, 10))));
+  list.querySelectorAll('.hl-checkbox').forEach(cb => {
+    cb.addEventListener('change', e => {
+      toggleHighlightSelection(parseInt(e.target.dataset.id, 10));
+      // Actualizar visual del card sin re-renderizar todo
+      const card = e.target.closest('.hl-card');
+      if (card) card.classList.toggle('selected', e.target.checked);
+    });
+  });
+
+  updateExportButton();
+  updateSelectionToolbar();
+}
+
+/* Muestra/oculta la barrita "Seleccionar todos / Limpiar" arriba de la lista. */
+function updateSelectionToolbar() {
+  const bar = document.getElementById('selection-toolbar');
+  if (!bar) return;
+  if (exportSelection.active) {
+    bar.style.display = 'flex';
+    const counter = document.getElementById('selection-counter');
+    if (counter) {
+      const n = exportSelection.selected.size;
+      const total = state.highlights.filter(h => h.bookId === state.currentBookId).length;
+      counter.textContent = n === 0 ? `0 / ${total}` : `${n} / ${total}`;
+    }
+  } else {
+    bar.style.display = 'none';
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2659,23 +2716,256 @@ function renderSidebar() {
   });
 }
 
-function exportTxt() {
-  const bhs  = state.highlights.filter(h => h.bookId === state.currentBookId);
-  const book = state.books.find(b => b.id === state.currentBookId);
-  if (!bhs.length) { setStatus('No hay subrayados para exportar'); return; }
-  let txt = `SUBRAYADOS — ${book ? book.title.toUpperCase() : 'LIBRO'}\n${'═'.repeat(50)}\n\n`;
-  bhs.forEach((h, i) => {
-    txt += `${i + 1}. "${h.text}"\n`;
-    if (h.note) txt += `   → ${h.note}\n`;
-    txt += '\n';
+// ════════════════════════════════════════════════════════════════
+//  EXPORT A OBSIDIAN (vía Drive /Lector-Inbox/)
+// ════════════════════════════════════════════════════════════════
+
+/* Estado del modo selección en la pestaña Subrayados.
+   Vive solo mientras la pestaña está abierta. */
+const exportSelection = {
+  active: false,         // ¿estamos en modo selección?
+  selected: new Set()    // IDs de highlights seleccionados
+};
+
+function toggleSelectionMode() {
+  exportSelection.active = !exportSelection.active;
+  if (!exportSelection.active) exportSelection.selected.clear();
+  renderHighlights();
+}
+
+function toggleHighlightSelection(id) {
+  if (exportSelection.selected.has(id)) exportSelection.selected.delete(id);
+  else                                  exportSelection.selected.add(id);
+  updateExportButton();
+}
+
+function selectAllHighlights() {
+  const bhs = state.highlights.filter(h => h.bookId === state.currentBookId);
+  for (const h of bhs) exportSelection.selected.add(h.id);
+  renderHighlights();
+}
+
+function clearSelection() {
+  exportSelection.selected.clear();
+  renderHighlights();
+}
+
+function updateExportButton() {
+  const btn = document.getElementById('export-btn');
+  if (!btn) return;
+  const n = exportSelection.selected.size;
+  if (exportSelection.active && n > 0) {
+    btn.textContent = `Exportar ${n} a Drive`;
+  } else {
+    btn.textContent = 'Exportar a Drive';
+  }
+}
+
+/* Genera el markdown con el formato Literature Note del briefing original. */
+function buildMarkdown(book, highlights) {
+  const lines = [];
+  lines.push('---');
+  lines.push('tipo: literatura');
+  lines.push('fuente: libro');
+  if (book.author) lines.push(`autor: ${book.author}`);
+  lines.push('estado: pendiente');
+  lines.push(`exportado: ${new Date().toISOString().split('T')[0]}`);
+  lines.push('---');
+  lines.push('');
+  lines.push(`# ${book.title}`);
+  lines.push('');
+  lines.push('## Highlights');
+  lines.push('');
+  // Ordenar por orden en el libro (paraIdx) si están disponibles, sino por timestamp
+  const sorted = highlights.slice().sort((a, b) => {
+    const pa = a.paraIdx != null ? a.paraIdx : 999999;
+    const pb = b.paraIdx != null ? b.paraIdx : 999999;
+    if (pa !== pb) return pa - pb;
+    return (a.ts || 0) - (b.ts || 0);
   });
-  txt += `Exportado el ${new Date().toLocaleDateString('es-ES')}`;
-  const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
-  const url  = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'subrayados.txt'; a.click();
-  URL.revokeObjectURL(url);
-  setStatus('Archivo exportado');
+  for (const h of sorted) {
+    // Quote: cada línea del texto prefijada con "> "
+    const quoted = h.text.split('\n').map(l => `> ${l}`).join('\n');
+    lines.push(quoted);
+    if (h.note && h.note.trim()) {
+      lines.push(`— ${h.note.trim()}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/* Crea o devuelve el ID de la carpeta Lector-Inbox.
+   El ID se cachea en prefs — si el usuario mueve o renombra la carpeta,
+   el ID sigue siendo válido. Si la borra, se crea una nueva. */
+async function getOrCreateInboxFolder() {
+  if (!driveReady) throw new Error('Drive no conectado');
+  const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                 gapi.client.getToken().access_token);
+  if (!token) throw new Error('Sin access token');
+
+  // 1. Chequear cache
+  const cached = await dbGet('prefs', 'inboxFolderId').catch(() => null);
+  if (cached && cached.value) {
+    // Verificar que la carpeta sigue existiendo (puede haberla borrado)
+    const verifyResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${cached.value}?fields=id,trashed`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (verifyResp.ok) {
+      const data = await verifyResp.json();
+      if (!data.trashed) return cached.value;
+    }
+    // Si llegamos acá, la carpeta cacheada ya no existe — limpiar y crear nueva
+    await dbDelete('prefs', 'inboxFolderId').catch(() => {});
+  }
+
+  // 2. Buscar por nombre en el Drive del usuario (en root)
+  // Solo busca carpetas que la app pueda ver con scope drive.file
+  const searchResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent("name='" + INBOX_FOLDER_NAME + "' and mimeType='application/vnd.google-apps.folder' and trashed=false")}&fields=files(id,name)`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (searchResp.ok) {
+    const searchData = await searchResp.json();
+    if (searchData.files && searchData.files.length > 0) {
+      const folderId = searchData.files[0].id;
+      await savePref('inboxFolderId', folderId);
+      return folderId;
+    }
+  }
+
+  // 3. No existe — crearla en root
+  const createResp = await fetch('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name: INBOX_FOLDER_NAME,
+      mimeType: 'application/vnd.google-apps.folder'
+    })
+  });
+  if (!createResp.ok) {
+    const txt = await createResp.text().catch(() => '');
+    throw new Error(`No pude crear carpeta: ${createResp.status} — ${txt.substring(0, 100)}`);
+  }
+  const meta = await createResp.json();
+  await savePref('inboxFolderId', meta.id);
+  return meta.id;
+}
+
+/* Sube un .md a la carpeta Lector-Inbox. Si ya existe un archivo con el
+   mismo nombre (mismo libro), lo reemplaza para que no haya duplicados. */
+async function uploadMarkdownToInbox(filename, markdown, folderId) {
+  const token = gapi.client.getToken().access_token;
+
+  // Buscar archivo existente con el mismo nombre en la carpeta
+  let existingId = null;
+  const listResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent("name='" + filename + "' and '" + folderId + "' in parents and trashed=false")}&fields=files(id,name)`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (listResp.ok) {
+    const data = await listResp.json();
+    if (data.files && data.files.length > 0) existingId = data.files[0].id;
+  }
+
+  let driveId = existingId;
+  if (!driveId) {
+    // Crear archivo
+    const createResp = await fetch('https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: filename,
+        parents: [folderId],
+        mimeType: 'text/markdown'
+      })
+    });
+    if (!createResp.ok) {
+      const txt = await createResp.text().catch(() => '');
+      throw new Error(`create md falló: ${createResp.status} — ${txt.substring(0, 100)}`);
+    }
+    const meta = await createResp.json();
+    driveId = meta.id;
+  }
+
+  // Subir contenido
+  const uploadResp = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${driveId}?uploadType=media`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'text/markdown; charset=UTF-8'
+      },
+      body: markdown
+    }
+  );
+  if (!uploadResp.ok) {
+    const txt = await uploadResp.text().catch(() => '');
+    throw new Error(`upload md falló: ${uploadResp.status} — ${txt.substring(0, 100)}`);
+  }
+  return { driveId, replaced: !!existingId };
+}
+
+/* Función principal. Decide qué highlights exportar según el modo:
+   - Modo selección activo + alguno seleccionado: solo los seleccionados.
+   - Modo selección activo + ninguno seleccionado: error, "elegí al menos uno".
+   - Modo selección NO activo: todos los highlights del libro actual. */
+async function exportToObsidian() {
+  if (!driveReady) {
+    setStatus('Conectá Drive primero para exportar');
+    return;
+  }
+  const book = state.books.find(b => b.id === state.currentBookId);
+  if (!book) { setStatus('Abrí un libro primero'); return; }
+
+  const all = state.highlights.filter(h => h.bookId === state.currentBookId);
+  let toExport;
+  if (exportSelection.active) {
+    if (exportSelection.selected.size === 0) {
+      setStatus('Seleccioná al menos un subrayado');
+      return;
+    }
+    toExport = all.filter(h => exportSelection.selected.has(h.id));
+  } else {
+    toExport = all;
+  }
+  if (!toExport.length) {
+    setStatus('No hay subrayados para exportar');
+    return;
+  }
+
+  showLoading('Exportando a Drive...');
+  try {
+    const folderId = await getOrCreateInboxFolder();
+    const md = buildMarkdown(book, toExport);
+    const safeTitle = book.title.replace(/[^\w\sáéíóúÁÉÍÓÚñÑ.-]/g, '_').substring(0, 80);
+    const filename = `${safeTitle}.md`;
+    const result = await uploadMarkdownToInbox(filename, md, folderId);
+
+    hideLoading();
+    const action = result.replaced ? 'reemplazado' : 'creado';
+    setStatus(`✓ ${toExport.length} subrayado${toExport.length !== 1 ? 's' : ''} ${action} en /Lector-Inbox/${filename}`);
+    console.log('[exportToObsidian] OK', { filename, count: toExport.length, replaced: result.replaced });
+
+    // Salir del modo selección si estaba activo
+    if (exportSelection.active) {
+      exportSelection.active = false;
+      exportSelection.selected.clear();
+      renderHighlights();
+    }
+  } catch (e) {
+    hideLoading();
+    console.error('[exportToObsidian]', e);
+    setStatus('Error exportando: ' + (e.message || '').substring(0, 80));
+  }
 }
 
 let statusTimer = null;

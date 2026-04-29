@@ -648,6 +648,69 @@ body.sidebar-hidden #sidebar { display: none; }
 }
 #export-btn:hover { opacity: 0.8; }
 
+#hl-actions { display: flex; gap: 8px; align-items: center; }
+
+#select-mode-btn {
+  font-size: 12px;
+  padding: 7px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  background: transparent;
+  color: var(--text-light);
+  border: 1px solid var(--border);
+  font-weight: 500;
+  transition: all 0.15s;
+}
+#select-mode-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Barra de modo selección */
+#selection-toolbar {
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+#selection-counter {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  flex: 1;
+}
+#selection-toolbar button {
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  background: transparent;
+  color: var(--text-light);
+  border: 1px solid var(--border);
+  font-weight: 500;
+  transition: all 0.15s;
+}
+#selection-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Checkbox y card seleccionada */
+.hl-checkbox {
+  width: 18px;
+  height: 18px;
+  margin-right: 8px;
+  flex-shrink: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+  align-self: center;
+}
+.hl-card.selectable { cursor: pointer; }
+.hl-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(200, 149, 108, 0.2);
+}
+
 #bookmarks-section {
   display: none;
   margin-bottom: 20px;

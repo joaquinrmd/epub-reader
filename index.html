@@ -105,8 +105,16 @@
       <div id="hl-header">
         <h3>Mis subrayados</h3>
         <div id="hl-actions">
-          <button id="export-btn" onclick="exportTxt()">Exportar .txt</button>
+          <button id="select-mode-btn" onclick="toggleSelectionMode()">Seleccionar</button>
+          <button id="export-btn" onclick="exportToObsidian()">Exportar a Drive</button>
         </div>
+      </div>
+      <!-- Barra que aparece solo en modo selección -->
+      <div id="selection-toolbar" style="display:none;">
+        <span id="selection-counter">0 / 0</span>
+        <button onclick="selectAllHighlights()">Todos</button>
+        <button onclick="clearSelection()">Limpiar</button>
+        <button onclick="toggleSelectionMode()">Cancelar</button>
       </div>
       <div id="bookmarks-section">
         <div id="bookmarks-header">🔖 Marcadores</div>
