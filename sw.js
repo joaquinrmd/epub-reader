@@ -17,7 +17,7 @@
    transparente (un blink y ya estás en la versión nueva).
    ════════════════════════════════════════════════════════ */
 
-const VERSION = 'v13-2026-04-28-delete-sync';
+const VERSION = 'v14-2026-04-29-fetch-sync-sidebar';
 const SHELL_CACHE  = 'mi-lector-shell-'  + VERSION;
 const ASSETS_CACHE = 'mi-lector-assets-' + VERSION;
 

@@ -46,6 +46,7 @@
       <p><span>+ Agregar libro</span><br>epub o txt</p>
     </div>
     <button id="drive-btn" onclick="initDrive()">Conectar Google Drive</button>
+    <button id="sync-now-btn" onclick="forceSyncNow()" title="Forzar sincronización ahora" style="display:none;">↻ Sincronizar ahora</button>
   </div>
 </div>
 
@@ -53,6 +54,7 @@
 <div id="main">
 
   <div id="header">
+    <button id="btn-toggle-sidebar" onclick="toggleSidebar()" title="Mostrar/ocultar sidebar">☰</button>
     <div id="book-title-display">Mi Lector</div>
     <div id="header-controls">
       <div id="font-controls">

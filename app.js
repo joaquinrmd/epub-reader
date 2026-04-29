@@ -119,6 +119,7 @@ window.addEventListener('load', async () => {
     await migrateFromLocalStorage();
     await loadState();
     applyPrefs();
+    await applySidebarPref();
     renderSidebar();
     setupReaderScroll();
     setupSelectionHandlers();
@@ -306,10 +307,7 @@ function initDrive(silent) {
           gapi.client.setToken({ access_token: resp.access_token });
         }
       }
-      document.getElementById('drive-btn').textContent = 'Drive conectado';
-      document.getElementById('drive-btn').classList.add('connected');
-      document.getElementById('drive-dot').classList.add('connected');
-      document.getElementById('drive-status-text').textContent = 'Google Drive activo';
+      markDriveAsConnected();
       savePref('driveAutoconnect', true);
       if (!silent) setStatus('Conectado — sincronizando...');
       else        setStatus('Drive sincronizando...');
@@ -319,6 +317,23 @@ function initDrive(silent) {
   // prompt vacío = sin UI si hay sesión activa de Google. Si no, fallará
   // silenciosamente con error 'no_session' / 'interaction_required'.
   tryRequestToken(silent);
+}
+
+/* Marca la UI como "Drive conectado" — incluye mostrar el botón
+   "Sincronizar ahora" que solo tiene sentido con conexión activa. */
+function markDriveAsConnected() {
+  driveReady = true;
+  const btn = document.getElementById('drive-btn');
+  if (btn) {
+    btn.textContent = 'Drive conectado';
+    btn.classList.add('connected');
+  }
+  const dot = document.getElementById('drive-dot');
+  if (dot) dot.classList.add('connected');
+  const statusText = document.getElementById('drive-status-text');
+  if (statusText) statusText.textContent = 'Google Drive activo';
+  const syncBtn = document.getElementById('sync-now-btn');
+  if (syncBtn) syncBtn.style.display = 'block';
 }
 
 function tryRequestToken(silent) {
@@ -343,12 +358,8 @@ async function tryAutoreconnectDrive() {
   if (tokRec && tokRec.value && tokRec.value.expiresAt > Date.now()) {
     // Tenemos token vigente — usarlo
     waitForGapiThen(() => {
-      driveReady = true;
       gapi.client.setToken({ access_token: tokRec.value.token });
-      document.getElementById('drive-btn').textContent = 'Drive conectado';
-      document.getElementById('drive-btn').classList.add('connected');
-      document.getElementById('drive-dot').classList.add('connected');
-      document.getElementById('drive-status-text').textContent = 'Google Drive activo';
+      markDriveAsConnected();
       setStatus('Drive sincronizando...');
       syncFromDrive();
     });
@@ -376,29 +387,40 @@ function waitForGapiThen(fn) {
 async function syncFromDrive() {
   showLoading('Sincronizando con Drive...');
   try {
-    const res   = await gapi.client.drive.files.list({
-      spaces: 'appDataFolder', q: `name='${DRIVE_FILE}'`, fields: 'files(id,name)'
-    });
-    const files = res.result.files;
-    if (files && files.length > 0) {
-      driveFileId   = files[0].id;
-      const content = await gapi.client.drive.files.get({ fileId: driveFileId, alt: 'media' });
-      await mergeState(JSON.parse(content.body));
-      // Reconciliar libros con sus archivos en Drive (busca book-{id}.epub
-      // para libros que no tengan driveEpubFileId cacheado)
+    const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                   gapi.client.getToken().access_token);
+    if (!token) throw new Error('sin token');
+
+    // Buscar el JSON
+    const listResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name='" + DRIVE_FILE + "'")}&fields=files(id,name)`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!listResp.ok) throw new Error('list falló: ' + listResp.status);
+    const listData = await listResp.json();
+
+    if (listData.files && listData.files.length > 0) {
+      driveFileId = listData.files[0].id;
+      const getResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!getResp.ok) throw new Error('get falló: ' + getResp.status);
+      const remoteData = await getResp.json();
+      await mergeState(remoteData);
       await reconcileBooksWithDrive();
       renderSidebar();
       renderHighlights();
-      // Si la pestaña actual es biblioteca, re-renderizar (libros pueden haberse borrado)
       if (currentTab === 'library') renderLibrary();
       setStatus('Sincronizado con Drive');
     } else {
-      await saveToDrive();
+      // No existe JSON remoto, crear uno con el estado local
+      await uploadJsonToDrive();
       setStatus('Datos guardados en Drive');
     }
   } catch (e) {
-    console.error('[Drive sync]', e);
-    setStatus('Error sincronizando — datos locales disponibles');
+    console.error('[syncFromDrive]', e);
+    setStatus('Error sincronizando: ' + (e.message || '').substring(0, 80));
   }
   hideLoading();
 }
@@ -411,15 +433,17 @@ async function syncFromDrive() {
    matchea con los libros locales. Mucho más rápido que pedir uno por uno. */
 async function reconcileBooksWithDrive() {
   if (!driveReady) return;
+  const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                 gapi.client.getToken().access_token);
+  if (!token) return;
   try {
-    const res = await gapi.client.drive.files.list({
-      spaces: 'appDataFolder',
-      q: "name contains 'book-'",
-      fields: 'files(id,name)',
-      pageSize: 500
-    });
-    const files = (res.result.files || []);
-    // Mapear name → id
+    const resp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name contains 'book-'")}&fields=files(id,name)&pageSize=500`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const files = data.files || [];
     const byName = {};
     for (const f of files) byName[f.name] = f.id;
 
@@ -430,7 +454,6 @@ async function reconcileBooksWithDrive() {
       const driveId = byName[filename];
       if (driveId && book.driveEpubFileId !== driveId) {
         book.driveEpubFileId = driveId;
-        // Persistir
         const full = await dbGet('books', book.id);
         if (full) {
           full.driveEpubFileId = driveId;
@@ -439,10 +462,7 @@ async function reconcileBooksWithDrive() {
         changed = true;
       }
     }
-    if (changed) {
-      // Re-guardar el JSON con los IDs reconciliados
-      saveToDrive();
-    }
+    if (changed) saveToDrive();
   } catch (e) {
     console.error('[reconcileBooksWithDrive]', e);
   }
@@ -565,69 +585,194 @@ async function mergeState(remote) {
   }
 }
 
+/* Hace el upload real del JSON de estado a Drive con fetch directo.
+   Devuelve true si se subió bien, false si falló. Lanza errores que
+   el caller puede capturar para mostrar mensajes específicos. */
+async function uploadJsonToDrive() {
+  if (!driveReady) throw new Error('Drive no conectado');
+  const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                 gapi.client.getToken().access_token);
+  if (!token) throw new Error('Sin access token');
+
+  const payload = JSON.stringify({
+    books: state.books.map(b => ({
+      id: b.id,
+      title: b.title,
+      author: b.author,
+      fileType: b.fileType || 'epub',
+      driveEpubFileId: b.driveEpubFileId || null
+    })),
+    highlights: state.highlights.map(h => {
+      const { remoteKnown, ...rest } = h;
+      return rest;
+    }),
+    nextId: state.nextId
+  });
+
+  // Si no tenemos driveFileId cacheado, buscar el archivo
+  if (!driveFileId) {
+    const listResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name='" + DRIVE_FILE + "'")}&fields=files(id,name)`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!listResp.ok) throw new Error('list falló: ' + listResp.status);
+    const data = await listResp.json();
+    if (data.files && data.files.length > 0) {
+      driveFileId = data.files[0].id;
+    } else {
+      // Crear el archivo primero
+      const createResp = await fetch('https://www.googleapis.com/drive/v3/files', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: DRIVE_FILE,
+          parents: ['appDataFolder'],
+          mimeType: 'application/json'
+        })
+      });
+      if (!createResp.ok) throw new Error('create falló: ' + createResp.status);
+      const meta = await createResp.json();
+      driveFileId = meta.id;
+    }
+  }
+
+  // Subir el contenido (PATCH con uploadType=media)
+  const uploadResp = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: payload
+    }
+  );
+  if (!uploadResp.ok) {
+    const txt = await uploadResp.text().catch(() => '');
+    throw new Error(`upload falló: ${uploadResp.status} — ${txt.substring(0, 200)}`);
+  }
+
+  // Verificar leyendo el archivo de vuelta
+  const verifyResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${driveFileId}?fields=id,size,modifiedTime`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!verifyResp.ok) throw new Error('verify falló: ' + verifyResp.status);
+  const verifyData = await verifyResp.json();
+  const remoteSize = parseInt(verifyData.size, 10);
+  const localSize = new Blob([payload]).size;
+  if (Math.abs(remoteSize - localSize) > 50) {
+    throw new Error(`tamaño no coincide: local=${localSize} remoto=${remoteSize}`);
+  }
+
+  console.log(`[saveToDrive] OK — ${localSize} bytes, ${state.books.length} libros, ${state.highlights.length} highlights`);
+
+  // Marcar todos los items como remoteKnown (baseline para detección de borrados)
+  for (const b of state.books) {
+    if (!b.remoteKnown) {
+      b.remoteKnown = true;
+      const full = await dbGet('books', b.id);
+      if (full) {
+        full.remoteKnown = true;
+        await dbPut('books', full);
+      }
+    }
+  }
+  for (const h of state.highlights) {
+    if (!h.remoteKnown) {
+      h.remoteKnown = true;
+      await dbPut('highlights', h);
+    }
+  }
+
+  return { localSize, remoteSize, books: state.books.length, highlights: state.highlights.length };
+}
+
+/* Versión debounced para llamadas automáticas (después de cada cambio).
+   Evita subir 10 veces seguidas si el usuario hace varios cambios rápidos. */
 async function saveToDrive() {
   if (!driveReady) return;
   clearTimeout(driveTimer);
   driveTimer = setTimeout(async () => {
     try {
-      const payload = JSON.stringify({
-        books: state.books.map(b => ({
-          id: b.id,
-          title: b.title,
-          author: b.author,
-          fileType: b.fileType || 'epub',
-          driveEpubFileId: b.driveEpubFileId || null
-        })),
-        highlights: state.highlights.map(h => {
-          // No serializar el flag interno remoteKnown al JSON remoto
-          const { remoteKnown, ...rest } = h;
-          return rest;
-        }),
-        nextId:     state.nextId
-      });
-      if (driveFileId) {
-        await gapi.client.request({
-          path: `/upload/drive/v3/files/${driveFileId}`,
-          method: 'PATCH', params: { uploadType: 'media' }, body: payload
-        });
-      } else {
-        const meta = await gapi.client.drive.files.create({
-          resource: { name: DRIVE_FILE, parents: ['appDataFolder'] }, fields: 'id'
-        });
-        driveFileId = meta.result.id;
-        await gapi.client.request({
-          path: `/upload/drive/v3/files/${driveFileId}`,
-          method: 'PATCH', params: { uploadType: 'media' }, body: payload
-        });
-      }
-
-      // Después del upload exitoso: marcar todos los items como remoteKnown.
-      // Eso establece la baseline para detectar borrados en sucesivos syncs.
-      let touched = false;
-      for (const b of state.books) {
-        if (!b.remoteKnown) {
-          b.remoteKnown = true;
-          const full = await dbGet('books', b.id);
-          if (full) {
-            full.remoteKnown = true;
-            await dbPut('books', full);
-          }
-          touched = true;
-        }
-      }
-      for (const h of state.highlights) {
-        if (!h.remoteKnown) {
-          h.remoteKnown = true;
-          await dbPut('highlights', h);
-          touched = true;
-        }
-      }
-
+      await uploadJsonToDrive();
       const ind = document.getElementById('sync-indicator');
-      ind.textContent = 'Guardado ✓';
-      setTimeout(() => { ind.textContent = ''; }, 2000);
-    } catch (e) { console.error('[saveToDrive]', e); }
+      if (ind) {
+        ind.textContent = 'Guardado ✓';
+        setTimeout(() => { ind.textContent = ''; }, 2000);
+      }
+    } catch (e) {
+      console.error('[saveToDrive]', e);
+      const ind = document.getElementById('sync-indicator');
+      if (ind) {
+        ind.textContent = 'Error guardando';
+        setTimeout(() => { ind.textContent = ''; }, 4000);
+      }
+    }
   }, 1200);
+}
+
+/* Versión inmediata para el botón "Sincronizar ahora".
+   Hace BAJADA + MERGE + SUBIDA en orden, todo síncrono y con feedback. */
+async function forceSyncNow() {
+  if (!driveReady) {
+    setStatus('Conectá Drive primero');
+    return;
+  }
+  showLoading('Sincronizando...');
+  try {
+    // 1. Bajar el JSON remoto actual
+    const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                   gapi.client.getToken().access_token);
+    if (!token) throw new Error('Sin access token — reconectá Drive');
+
+    let remoteData = { books: [], highlights: [], nextId: 1 };
+    if (!driveFileId) {
+      // Intentar localizar el archivo
+      const listResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name='" + DRIVE_FILE + "'")}&fields=files(id,name)`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (listResp.ok) {
+        const data = await listResp.json();
+        if (data.files && data.files.length > 0) driveFileId = data.files[0].id;
+      }
+    }
+    if (driveFileId) {
+      const getResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (getResp.ok) {
+        try { remoteData = await getResp.json(); }
+        catch (e) { console.warn('[forceSync] JSON remoto inválido', e); }
+      }
+    }
+
+    // 2. Mergear remoto con local
+    await mergeState(remoteData);
+    await reconcileBooksWithDrive();
+
+    // 3. Subir el resultado mergeado
+    const result = await uploadJsonToDrive();
+
+    // 4. Re-renderizar todo
+    renderSidebar();
+    renderHighlights();
+    if (currentTab === 'library') renderLibrary();
+
+    hideLoading();
+    setStatus(`✓ Sincronizado: ${result.books} libros, ${result.highlights} subrayados`);
+    console.log('[forceSync] OK', result);
+  } catch (e) {
+    hideLoading();
+    console.error('[forceSync]', e);
+    setStatus('Error sincronizando: ' + (e.message || 'desconocido').substring(0, 80));
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1287,16 +1432,19 @@ async function selectBook(id) {
 /* Busca book-{id}.{epub|txt} en appDataFolder. Devuelve el driveFileId o null. */
 async function findBookInDrive(bookId, fileType) {
   if (!driveReady) return null;
+  const token = (window.gapi && gapi.client && gapi.client.getToken &&
+                 gapi.client.getToken().access_token);
+  if (!token) return null;
   try {
     const ext = fileType === 'txt' ? 'txt' : 'epub';
     const filename = `book-${bookId}.${ext}`;
-    const res = await gapi.client.drive.files.list({
-      spaces: 'appDataFolder',
-      q: `name='${filename}'`,
-      fields: 'files(id,name)'
-    });
-    const files = res.result.files;
-    if (files && files.length > 0) return files[0].id;
+    const resp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${encodeURIComponent("name='" + filename + "'")}&fields=files(id,name)`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (data.files && data.files.length > 0) return data.files[0].id;
     return null;
   } catch (e) {
     console.error('[findBookInDrive]', e);
@@ -1695,6 +1843,20 @@ async function renderBookmarks() {
 // ════════════════════════════════════════════════════════════════
 //  HIGHLIGHTS
 // ════════════════════════════════════════════════════════════════
+
+/* Esconde/muestra el sidebar. La preferencia se guarda en IndexedDB. */
+function toggleSidebar() {
+  document.body.classList.toggle('sidebar-hidden');
+  const hidden = document.body.classList.contains('sidebar-hidden');
+  savePref('sidebarHidden', hidden);
+}
+
+async function applySidebarPref() {
+  const rec = await dbGet('prefs', 'sidebarHidden').catch(() => null);
+  if (rec && rec.value === true) {
+    document.body.classList.add('sidebar-hidden');
+  }
+}
 
 function setColor(c) {
   currentColor = c;

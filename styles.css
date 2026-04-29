@@ -84,6 +84,9 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
+/* Sidebar oculta — el #main toma todo el ancho */
+body.sidebar-hidden #sidebar { display: none; }
+
 /* ─── SIDEBAR ─── */
 #sidebar {
   width: 240px;
@@ -232,6 +235,21 @@ body {
 #drive-btn:hover     { border-color: var(--accent); color: var(--accent); }
 #drive-btn.connected { border-color: #166534; background: #14532d22; color: #4ade80; }
 
+#sync-now-btn {
+  width: 100%;
+  padding: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 7px;
+  font-family: 'DM Sans', sans-serif;
+  border: 1px solid #3a3a3a;
+  background: transparent;
+  color: var(--sidebar-muted);
+  font-weight: 500;
+  transition: all 0.15s;
+}
+#sync-now-btn:hover { border-color: var(--accent); color: var(--accent); }
+
 /* ─── MAIN ─── */
 #main {
   flex: 1;
@@ -251,6 +269,20 @@ body {
   min-height: 52px;
   padding-top: max(10px, env(safe-area-inset-top));
 }
+
+#btn-toggle-sidebar {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-light);
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+  line-height: 1;
+}
+#btn-toggle-sidebar:hover { border-color: var(--accent); color: var(--accent); }
 #book-title-display {
   font-family: 'Lora', serif;
   font-size: 15px;
