@@ -2105,12 +2105,14 @@ function wrapTextInElement(paraEl, text, id, color) {
 
 async function deleteHighlight(id) {
   state.highlights = state.highlights.filter(h => h.id !== id);
-  const span = document.querySelector(`[data-hl-id="${id}"]`);
-  if (span) {
+  // Borrar TODOS los spans con ese hl-id (puede haber más de uno si en el
+  // futuro implementamos highlights multi-párrafo).
+  document.querySelectorAll(`[data-hl-id="${CSS.escape(String(id))}"]`).forEach(span => {
     const p = span.parentNode;
     while (span.firstChild) p.insertBefore(span.firstChild, span);
     p.removeChild(span);
-  }
+    if (p.normalize) p.normalize();
+  });
   await dbDelete('highlights', id);
   saveToDrive();
   renderHighlights();
@@ -2195,12 +2197,8 @@ function renderHighlights() {
   // Click en el texto del highlight → ir a esa parte del libro
   list.querySelectorAll('.hl-clickable').forEach(el => {
     el.addEventListener('click', e => {
-      console.log('[click hl-clickable]', e.currentTarget.dataset.id);
       // No hacer nada si estamos en modo selección (ahí el click toggle el checkbox)
-      if (exportSelection.active) {
-        console.log('[click hl-clickable] ignorado: modo selección activo');
-        return;
-      }
+      if (exportSelection.active) return;
       const id = e.currentTarget.dataset.id;
       goToHighlight(id);
     });
@@ -2213,29 +2211,24 @@ function renderHighlights() {
 /* Navega al texto del highlight dentro del libro: cambia a la pestaña Leer
    y hace scroll al span correspondiente. Si el span no existe en el DOM
    (porque no se pintó por algún motivo), intenta pintarlo primero. */
+/* Navega al texto del highlight dentro del libro: cambia a la pestaña Leer
+   y hace scroll al span correspondiente. Si el span no existe en el DOM
+   (porque no se pintó por algún motivo), intenta pintarlo primero. */
 function goToHighlight(id) {
-  console.log('[goToHighlight] called with id:', id);
-  console.log('[goToHighlight] state.highlights count:', state.highlights.length);
   const hl = state.highlights.find(h => h.id === id);
-  console.log('[goToHighlight] found:', hl);
   if (!hl) {
-    console.warn('[goToHighlight] no highlight match. IDs in state:', state.highlights.map(h => h.id));
     setStatus('No se encontró ese subrayado');
     return;
   }
 
   // 1. Cambiar a la pestaña Leer
-  console.log('[goToHighlight] cambiando a tab reader');
   showTab('reader');
 
   // 2. Buscar el span en el DOM. Si no está, intentar aplicar highlights ahora.
   let span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
-  console.log('[goToHighlight] span en DOM?', !!span);
   if (!span) {
-    // Intentar pintar todos los highlights del libro actual
     if (typeof applyHighlightsToContent === 'function') applyHighlightsToContent();
     span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
-    console.log('[goToHighlight] span después de re-aplicar?', !!span);
   }
 
   // 3. Si está, scroll suave hasta él. Si no, fallback al párrafo paraIdx.
@@ -2259,7 +2252,7 @@ function goToHighlight(id) {
   }, 50);
 }
 
-// Exponer al scope global por si acaso
+// Exponer al scope global para que onclicks inline puedan llamarla
 window.goToHighlight = goToHighlight;
 
 /* Muestra/oculta la barrita "Seleccionar todos / Limpiar" arriba de la lista. */
