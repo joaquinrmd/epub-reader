@@ -2014,11 +2014,16 @@ async function doHighlight() {
   const { range, text, paraIdx } = pendingHighlight;
   if (!text) { hideSel(); return; }
 
+  // Normalizar el texto: si la selección cruza párrafos, sel.toString() incluye
+  // saltos de línea entre ellos. Los reemplazamos por un solo espacio para que
+  // el texto guardado sea continuo (más limpio para mostrar y exportar).
+  const normalizedText = text.replace(/\s+/g, ' ').trim();
+
   try {
     const id = generateId('hl');
     const hl = {
       id, bookId: state.currentBookId,
-      text, note: '', color: currentColor, ts: Date.now(),
+      text: normalizedText, note: '', color: currentColor, ts: Date.now(),
       paraIdx: paraIdx != null ? paraIdx : undefined
     };
 
@@ -2035,18 +2040,107 @@ async function doHighlight() {
     setStatus('Subrayado guardado');
   } catch (e) {
     console.error('[doHighlight]', e);
-    setStatus('Seleccioná texto dentro de un mismo párrafo');
+    setStatus('Error al subrayar — intentá de nuevo');
   }
   hideSel();
 }
 
+/* Crea uno o varios spans para el highlight. Si el rango está dentro de
+   un solo párrafo (caso típico), usa surroundContents y termina. Si cruza
+   varios párrafos, recorre los nodos de texto del rango y envuelve cada
+   tramo en su propio span (todos con el mismo data-hl-id), uno por
+   párrafo. Visualmente se ve continuo, pero internamente son varios
+   elementos. Borrar uno = borrar todos los que comparten el ID. */
 function wrapRange(range, id, color) {
-  const span = document.createElement('span');
-  span.className = `hl hl-${color}`;
-  span.dataset.hlId = id;
-  span.title = 'Clic para ver notas';
-  span.onclick = () => showTab('highlights');
-  range.surroundContents(span);
+  // Caso simple: el rango está totalmente dentro de un mismo párrafo.
+  // Probamos surroundContents primero porque es atómico y rápido.
+  try {
+    const span = document.createElement('span');
+    span.className = `hl hl-${color}`;
+    span.dataset.hlId = id;
+    span.title = 'Clic para ver notas';
+    span.onclick = () => showTab('highlights');
+    range.surroundContents(span);
+    return;
+  } catch (e) {
+    // Falla si el rango cruza límites de elementos (ej. dos párrafos).
+    // Vamos al camino multi-span.
+  }
+
+  wrapRangeMulti(range, id, color);
+}
+
+/* Recorre todos los nodos de texto que el rango toca y los envuelve por
+   tramos. Cada nodo de texto se envuelve por separado, así no rompemos
+   la estructura HTML existente ni intentamos cruzar elementos.
+
+   Estrategia: clonar el rango para no perderlo, recorrer todos los
+   text nodes que toca el range, y para cada uno crear un span nuevo
+   alrededor del subtramo correspondiente. */
+function wrapRangeMulti(range, id, color) {
+  const startNode = range.startContainer;
+  const startOffset = range.startOffset;
+  const endNode = range.endContainer;
+  const endOffset = range.endOffset;
+
+  // Caminar el DOM en orden recolectando todos los text nodes que el
+  // range toca.
+  const root = range.commonAncestorContainer.nodeType === 3
+    ? range.commonAncestorContainer.parentNode
+    : range.commonAncestorContainer;
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      // Saltar nodos que ya estén dentro de un highlight existente
+      if (node.parentElement && node.parentElement.classList.contains('hl')) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  const textNodes = [];
+  let current = walker.nextNode();
+  let started = false;
+  while (current) {
+    if (current === startNode) started = true;
+    if (started) textNodes.push(current);
+    if (current === endNode) break;
+    current = walker.nextNode();
+  }
+
+  // Para cada text node, crear su sub-rango y envolverlo en un span propio
+  for (const node of textNodes) {
+    const subRange = document.createRange();
+    if (node === startNode && node === endNode) {
+      subRange.setStart(node, startOffset);
+      subRange.setEnd(node, endOffset);
+    } else if (node === startNode) {
+      subRange.setStart(node, startOffset);
+      subRange.setEnd(node, node.nodeValue.length);
+    } else if (node === endNode) {
+      subRange.setStart(node, 0);
+      subRange.setEnd(node, endOffset);
+    } else {
+      subRange.selectNodeContents(node);
+    }
+
+    // Si el sub-rango quedó vacío (solo espacios al borde), saltar
+    if (subRange.toString().trim().length === 0) continue;
+
+    try {
+      const span = document.createElement('span');
+      span.className = `hl hl-${color}`;
+      span.dataset.hlId = id;
+      span.title = 'Clic para ver notas';
+      span.onclick = () => showTab('highlights');
+      subRange.surroundContents(span);
+    } catch (e) {
+      // Si por alguna razón falla un tramo individual, lo saltamos pero
+      // seguimos con los demás.
+      console.warn('[wrapRangeMulti] tramo skip', e);
+    }
+  }
 }
 
 function applyHighlightsToContent() {
@@ -2055,9 +2149,10 @@ function applyHighlightsToContent() {
   const bookHls = state.highlights.filter(h => h.bookId === state.currentBookId);
 
   for (const hl of bookHls) {
-    if (container.querySelector(`[data-hl-id="${hl.id}"]`)) continue;
+    if (container.querySelector(`[data-hl-id="${CSS.escape(hl.id)}"]`)) continue;
     let applied = false;
 
+    // Intento 1: el texto está completo dentro de un párrafo
     if (hl.paraIdx !== undefined && hl.paraIdx !== null) {
       const paraEl = container.querySelector(`[data-para-idx="${hl.paraIdx}"]`);
       if (paraEl && paraEl.textContent.includes(hl.text)) {
@@ -2065,6 +2160,7 @@ function applyHighlightsToContent() {
       }
     }
 
+    // Intento 2: búsqueda en todo el container — texto contiguo en un nodo
     if (!applied) {
       const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
       let node;
@@ -2082,6 +2178,80 @@ function applyHighlightsToContent() {
         break;
       }
     }
+
+    // Intento 3: el highlight cruza párrafos. Buscar el texto normalizado
+    // (sin saltos) en el texto normalizado del container.
+    if (!applied) {
+      applied = applyHighlightCrossParagraph(container, hl);
+    }
+  }
+}
+
+/* Reaplica un highlight que cruza párrafos. Estrategia: armar un mapa de
+   posiciones del texto normalizado del container → nodos+offsets reales,
+   buscar el texto del highlight (también normalizado) en ese string, y
+   reconstruir un range que cubra esos nodos. Después llamamos a
+   wrapRangeMulti para crear los varios spans. */
+function applyHighlightCrossParagraph(container, hl) {
+  // Recolectar todos los text nodes en orden, ignorando los que ya están
+  // dentro de un highlight existente.
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (node.parentElement && node.parentElement.classList.contains('hl')) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  // Construir un string normalizado y un mapa { posición en string → {node, offset} }
+  let normalized = '';
+  const map = []; // [{ start, end, node }]
+  let node;
+  while ((node = walker.nextNode())) {
+    const txt = node.nodeValue;
+    if (!txt) continue;
+    // Normalizar igual que cuando guardamos: \s+ → un espacio
+    // Pero conservar el mapeo a posiciones originales del nodo.
+    let prevWasSpace = normalized.length > 0 && normalized[normalized.length - 1] === ' ';
+    let nodeStart = normalized.length;
+    for (let i = 0; i < txt.length; i++) {
+      const ch = txt[i];
+      const isSpace = /\s/.test(ch);
+      if (isSpace) {
+        if (!prevWasSpace) {
+          normalized += ' ';
+          map.push({ pos: normalized.length - 1, node, offset: i });
+          prevWasSpace = true;
+        }
+        // Si es espacio y el anterior también era espacio, lo skipeamos
+      } else {
+        normalized += ch;
+        map.push({ pos: normalized.length - 1, node, offset: i });
+        prevWasSpace = false;
+      }
+    }
+  }
+
+  // Buscar el texto del highlight en el normalizado (también normalizar el texto del HL por las dudas)
+  const hlTextNormalized = hl.text.replace(/\s+/g, ' ').trim();
+  const idx = normalized.indexOf(hlTextNormalized);
+  if (idx === -1) return false;
+
+  // Encontrar el primer y último mapping correspondiente
+  const startEntry = map.find(m => m.pos === idx);
+  const endEntry = map.find(m => m.pos === idx + hlTextNormalized.length - 1);
+  if (!startEntry || !endEntry) return false;
+
+  try {
+    const range = document.createRange();
+    range.setStart(startEntry.node, startEntry.offset);
+    range.setEnd(endEntry.node, endEntry.offset + 1);
+    wrapRangeMulti(range, hl.id, hl.color);
+    return true;
+  } catch (e) {
+    console.warn('[applyHighlightCrossParagraph] failed', e);
+    return false;
   }
 }
 
