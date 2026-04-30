@@ -1101,3 +1101,21 @@ body.sidebar-hidden #sidebar { display: none; }
   :root { --reader-pad-x: 18px; --reader-pad-y: 24px; }
   #sidebar { display: none; }
 }
+
+/* ─── Flash visual al ir a un highlight desde la lista ───
+   Aplicado momentáneamente cuando hacés click en una cita y se hace scroll
+   al texto. Le da un "flash" para que veas dónde quedaste. */
+.hl-flash {
+  outline: 3px solid var(--accent, #c8956c);
+  outline-offset: 2px;
+  border-radius: 3px;
+  transition: outline-color 0.4s ease;
+}
+
+/* Cursor pointer en el texto del highlight para indicar que es clickeable */
+.hl-clickable {
+  cursor: pointer;
+}
+.hl-clickable:hover {
+  filter: brightness(1.1);
+}

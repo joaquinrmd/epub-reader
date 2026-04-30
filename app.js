@@ -33,8 +33,22 @@ const THEMES      = ['day', 'sepia', 'night'];
 const THEME_ICONS = { day: '☀', sepia: '📜', night: '🌙' };
 
 // ── Estado global ──
-let state = { books: [], highlights: [], currentBookId: null, nextId: 1 };
+let state = { books: [], highlights: [], currentBookId: null };
 let prefs = { theme: 'day', fontSize: 17 };
+
+/* Generador de IDs únicos universales para evitar colisiones entre
+   dispositivos cuando sincronizan vía Drive. Formato:
+     {prefix}-{timestamp}-{random}
+   Por ejemplo: hl-1730312345678-x9k2pq
+
+   Esto reemplaza al sistema viejo de nextId++ que generaba IDs
+   numéricos secuenciales independientes en cada dispositivo (compu
+   y iPad podían ambos generar id=47 y al sincronizar se pisaban). */
+function generateId(prefix) {
+  const ts = Date.now();
+  const rnd = Math.random().toString(36).substring(2, 10);
+  return `${prefix}-${ts}-${rnd}`;
+}
 
 // ── Estado del libro abierto ──
 let allParagraphs       = [];
@@ -155,7 +169,6 @@ async function migrateFromLocalStorage() {
     for (const h of (old.highlights || [])) {
       if (!(await dbGet('highlights', h.id))) await dbPut('highlights', h);
     }
-    if (old.nextId)        await dbPut('prefs', { key: 'nextId', value: old.nextId });
     if (old.currentBookId) await dbPut('prefs', { key: 'currentBookId', value: old.currentBookId });
     localStorage.removeItem('mi_lector_v2');
   } catch (e) {}
@@ -172,7 +185,6 @@ async function loadState() {
     remoteKnown: !!b.remoteKnown
   }));
   state.highlights = await dbGetAll('highlights');
-  const nid = await dbGet('prefs', 'nextId');         state.nextId        = nid ? nid.value : 1;
   const cur = await dbGet('prefs', 'currentBookId');  state.currentBookId = cur ? cur.value : null;
   const th  = await dbGet('prefs', 'theme');          prefs.theme         = th  ? th.value  : 'day';
   const fs  = await dbGet('prefs', 'fontSize');       prefs.fontSize      = fs  ? fs.value  : 17;
@@ -510,9 +522,23 @@ async function mergeState(remote) {
   );
   for (const h of hlsToDelete) {
     await dbDelete('highlights', h.id).catch(() => {});
+    // Despintar el span del DOM si está visible (libro actualmente abierto)
+    const span = document.querySelector(`[data-hl-id="${h.id}"]`);
+    if (span) {
+      const parent = span.parentNode;
+      while (span.firstChild) parent.insertBefore(span.firstChild, span);
+      parent.removeChild(span);
+      // Normalizar para juntar nodos de texto adyacentes
+      if (parent.normalize) parent.normalize();
+    }
   }
   if (hlsToDelete.length) {
     state.highlights = state.highlights.filter(h => !hlsToDelete.some(d => d.id === h.id));
+  }
+
+  // 3. Pintar highlights nuevos del remoto en el DOM (si el libro actual es el mismo)
+  if (typeof applyHighlightsToContent === 'function' && state.currentBookId) {
+    applyHighlightsToContent();
   }
 
   // ─── BOOKS ───
@@ -582,11 +608,6 @@ async function mergeState(remote) {
     state.books      = state.books.filter(b => !toDeleteIds.has(b.id));
     state.highlights = state.highlights.filter(h => !toDeleteIds.has(h.bookId));
   }
-
-  if ((remote.nextId || 0) > state.nextId) {
-    state.nextId = remote.nextId;
-    await savePref('nextId', state.nextId);
-  }
 }
 
 /* Hace el upload real del JSON de estado a Drive con fetch directo.
@@ -609,8 +630,7 @@ async function uploadJsonToDrive() {
     highlights: state.highlights.map(h => {
       const { remoteKnown, ...rest } = h;
       return rest;
-    }),
-    nextId: state.nextId
+    })
   });
 
   // Si no tenemos driveFileId cacheado, buscar el archivo
@@ -734,7 +754,7 @@ async function forceSyncNow() {
                    gapi.client.getToken().access_token);
     if (!token) throw new Error('Sin access token — reconectá Drive');
 
-    let remoteData = { books: [], highlights: [], nextId: 1 };
+    let remoteData = { books: [], highlights: [] };
     if (!driveFileId) {
       // Intentar localizar el archivo
       const listResp = await fetch(
@@ -1331,7 +1351,7 @@ async function loadTxt(file) {
 }
 
 async function addBook(title, author, chapters, coverBase64, originalFile) {
-  const id = state.nextId++;
+  const id = generateId('book');
   const fileType = originalFile && originalFile.name.toLowerCase().endsWith('.epub')
     ? 'epub' : 'txt';
 
@@ -1342,7 +1362,6 @@ async function addBook(title, author, chapters, coverBase64, originalFile) {
     driveEpubFileId: null
   });
   state.books.push({ id, title, author, fileType, driveEpubFileId: null });
-  await savePref('nextId', state.nextId);
   await savePref('currentBookId', id);
   saveToDrive();
   renderSidebar();
@@ -1802,14 +1821,13 @@ async function addBookmark() {
   const pct     = sh > 0 ? Math.round((viewer.scrollTop / sh) * 100) : 0;
   const label   = `${chapStr} · ${pct}%`;
   const anchor  = getFirstVisibleParaIdx();
-  const id      = state.nextId++;
+  const id      = generateId('bm');
   await dbPut('bookmarks', {
     id, bookId: state.currentBookId,
     anchorParaIdx: anchor != null ? anchor : 0,
     label,
     ts: Date.now()
   });
-  await savePref('nextId', state.nextId);
   setStatus('🔖 ' + label);
 }
 
@@ -1841,7 +1859,7 @@ async function renderBookmarks() {
   });
   list.querySelectorAll('.bookmark-delete').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await dbDelete('bookmarks', parseInt(btn.dataset.id, 10));
+      await dbDelete('bookmarks', btn.dataset.id);
       renderBookmarks();
       setStatus('Marcador eliminado');
     });
@@ -1997,7 +2015,7 @@ async function doHighlight() {
   if (!text) { hideSel(); return; }
 
   try {
-    const id = state.nextId++;
+    const id = generateId('hl');
     const hl = {
       id, bookId: state.currentBookId,
       text, note: '', color: currentColor, ts: Date.now(),
@@ -2012,7 +2030,6 @@ async function doHighlight() {
     if (sel) sel.removeAllRanges();
 
     await dbPut('highlights', hl);
-    await savePref('nextId', state.nextId);
     saveToDrive();
     renderSidebar();
     setStatus('Subrayado guardado');
@@ -2139,7 +2156,7 @@ function renderHighlights() {
         ${checkboxHtml}
         <div class="hl-strip" style="background:${cs[h.color]||cs.yellow};"></div>
         <div class="hl-card-body">
-          <div class="hl-text" style="background:${cb[h.color]||cb.yellow};">${escHtml(h.text)}</div>
+          <div class="hl-text hl-clickable" style="background:${cb[h.color]||cb.yellow};" data-id="${h.id}" title="Ir a esta parte del libro">${escHtml(h.text)}</div>
           <div class="hl-footer">
             <input class="hl-note" placeholder="Agregar nota..." value="${escHtml(h.note||'')}" data-id="${h.id}">
             <button class="hl-delete" data-id="${h.id}">Borrar</button>
@@ -2152,7 +2169,7 @@ function renderHighlights() {
   // Listeners
   list.querySelectorAll('.hl-note').forEach(inp => {
     inp.addEventListener('change', async e => {
-      const h = state.highlights.find(h => h.id === parseInt(e.target.dataset.id, 10));
+      const h = state.highlights.find(h => h.id === e.target.dataset.id);
       if (h) {
         h.note = e.target.value;
         // Cuando se edita la nota, hay que volver a marcarlo como NO sincronizado
@@ -2165,18 +2182,71 @@ function renderHighlights() {
     });
   });
   list.querySelectorAll('.hl-delete').forEach(btn =>
-    btn.addEventListener('click', e => deleteHighlight(parseInt(e.target.dataset.id, 10))));
+    btn.addEventListener('click', e => deleteHighlight(e.target.dataset.id)));
   list.querySelectorAll('.hl-checkbox').forEach(cb => {
     cb.addEventListener('change', e => {
-      toggleHighlightSelection(parseInt(e.target.dataset.id, 10));
+      toggleHighlightSelection(e.target.dataset.id);
       // Actualizar visual del card sin re-renderizar todo
       const card = e.target.closest('.hl-card');
       if (card) card.classList.toggle('selected', e.target.checked);
     });
   });
 
+  // Click en el texto del highlight → ir a esa parte del libro
+  list.querySelectorAll('.hl-clickable').forEach(el => {
+    el.addEventListener('click', e => {
+      // No hacer nada si estamos en modo selección (ahí el click toggle el checkbox)
+      if (exportSelection.active) return;
+      const id = e.currentTarget.dataset.id;
+      goToHighlight(id);
+    });
+  });
+
   updateExportButton();
   updateSelectionToolbar();
+}
+
+/* Navega al texto del highlight dentro del libro: cambia a la pestaña Leer
+   y hace scroll al span correspondiente. Si el span no existe en el DOM
+   (porque no se pintó por algún motivo), intenta pintarlo primero. */
+function goToHighlight(id) {
+  const hl = state.highlights.find(h => h.id === id);
+  if (!hl) {
+    setStatus('No se encontró ese subrayado');
+    return;
+  }
+
+  // 1. Cambiar a la pestaña Leer
+  showTab('reader');
+
+  // 2. Buscar el span en el DOM. Si no está, intentar aplicar highlights ahora.
+  let span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
+  if (!span) {
+    // Intentar pintar todos los highlights del libro actual
+    if (typeof applyHighlightsToContent === 'function') applyHighlightsToContent();
+    span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
+  }
+
+  // 3. Si está, scroll suave hasta él. Si no, fallback al párrafo paraIdx.
+  setTimeout(() => {
+    if (span) {
+      span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Flash visual: subrayar más fuerte por un segundo
+      span.classList.add('hl-flash');
+      setTimeout(() => span.classList.remove('hl-flash'), 1600);
+    } else if (hl.paraIdx != null) {
+      const para = document.querySelector(`[data-para-idx="${hl.paraIdx}"]`);
+      if (para) {
+        para.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        para.classList.add('hl-flash');
+        setTimeout(() => para.classList.remove('hl-flash'), 1600);
+      } else {
+        setStatus('No se pudo localizar el subrayado en el texto');
+      }
+    } else {
+      setStatus('No se pudo localizar el subrayado en el texto');
+    }
+  }, 50);
 }
 
 /* Muestra/oculta la barrita "Seleccionar todos / Limpiar" arriba de la lista. */
@@ -2305,21 +2375,21 @@ async function renderLibrary() {
     let actionsHtml;
     if (hasCnt) {
       actionsHtml = `
-        <button class="btn-card btn-card-open" onclick="selectBook(${book.id})">Abrir</button>
-        <button class="btn-card btn-card-free" onclick="freeBookSpace(${book.id})">Liberar</button>
-        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+        <button class="btn-card btn-card-open" onclick="selectBook('${book.id}')">Abrir</button>
+        <button class="btn-card btn-card-free" onclick="freeBookSpace('${book.id}')">Liberar</button>
+        <button class="btn-card btn-card-delete" onclick="deleteBook('${book.id}')">🗑</button>`;
     } else if (inDrive) {
       actionsHtml = `
-        <button class="btn-card btn-card-download" onclick="downloadBookFromDrive(${book.id})">Descargar</button>
-        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+        <button class="btn-card btn-card-download" onclick="downloadBookFromDrive('${book.id}')">Descargar</button>
+        <button class="btn-card btn-card-delete" onclick="deleteBook('${book.id}')">🗑</button>`;
     } else {
       actionsHtml = `
         <button class="btn-card btn-card-open" disabled>Abrir</button>
-        <button class="btn-card btn-card-delete" onclick="deleteBook(${book.id})">🗑</button>`;
+        <button class="btn-card btn-card-delete" onclick="deleteBook('${book.id}')">🗑</button>`;
     }
 
     card.innerHTML = `
-      <div class="book-cover" onclick="${hasCnt ? `selectBook(${book.id})` : (inDrive ? `downloadBookFromDrive(${book.id})` : '')}">
+      <div class="book-cover" onclick="${hasCnt ? `selectBook('${book.id}')` : (inDrive ? `downloadBookFromDrive('${book.id}')` : '')}">
         ${coverHtml}${badge}
       </div>
       <div class="book-card-info">
@@ -2707,11 +2777,11 @@ function renderSidebar() {
     const div   = document.createElement('div');
     div.className = 'book-item' + (b.id === state.currentBookId ? ' active' : '');
     div.innerHTML = `
-      <div class="book-item-info" onclick="selectBook(${b.id})">
+      <div class="book-item-info" onclick="selectBook('${b.id}')">
         <div class="book-title">${escHtml(b.title)}</div>
         <div class="book-meta">${count} subrayado${count !== 1 ? 's' : ''}</div>
       </div>
-      <button class="btn-book-delete" onclick="deleteBook(${b.id})" title="Borrar libro">🗑</button>`;
+      <button class="btn-book-delete" onclick="deleteBook('${b.id}')" title="Borrar libro">🗑</button>`;
     list.appendChild(div);
   });
 }
