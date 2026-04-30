@@ -2195,8 +2195,12 @@ function renderHighlights() {
   // Click en el texto del highlight → ir a esa parte del libro
   list.querySelectorAll('.hl-clickable').forEach(el => {
     el.addEventListener('click', e => {
+      console.log('[click hl-clickable]', e.currentTarget.dataset.id);
       // No hacer nada si estamos en modo selección (ahí el click toggle el checkbox)
-      if (exportSelection.active) return;
+      if (exportSelection.active) {
+        console.log('[click hl-clickable] ignorado: modo selección activo');
+        return;
+      }
       const id = e.currentTarget.dataset.id;
       goToHighlight(id);
     });
@@ -2210,28 +2214,34 @@ function renderHighlights() {
    y hace scroll al span correspondiente. Si el span no existe en el DOM
    (porque no se pintó por algún motivo), intenta pintarlo primero. */
 function goToHighlight(id) {
+  console.log('[goToHighlight] called with id:', id);
+  console.log('[goToHighlight] state.highlights count:', state.highlights.length);
   const hl = state.highlights.find(h => h.id === id);
+  console.log('[goToHighlight] found:', hl);
   if (!hl) {
+    console.warn('[goToHighlight] no highlight match. IDs in state:', state.highlights.map(h => h.id));
     setStatus('No se encontró ese subrayado');
     return;
   }
 
   // 1. Cambiar a la pestaña Leer
+  console.log('[goToHighlight] cambiando a tab reader');
   showTab('reader');
 
   // 2. Buscar el span en el DOM. Si no está, intentar aplicar highlights ahora.
   let span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
+  console.log('[goToHighlight] span en DOM?', !!span);
   if (!span) {
     // Intentar pintar todos los highlights del libro actual
     if (typeof applyHighlightsToContent === 'function') applyHighlightsToContent();
     span = document.querySelector(`[data-hl-id="${CSS.escape(id)}"]`);
+    console.log('[goToHighlight] span después de re-aplicar?', !!span);
   }
 
   // 3. Si está, scroll suave hasta él. Si no, fallback al párrafo paraIdx.
   setTimeout(() => {
     if (span) {
       span.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      // Flash visual: subrayar más fuerte por un segundo
       span.classList.add('hl-flash');
       setTimeout(() => span.classList.remove('hl-flash'), 1600);
     } else if (hl.paraIdx != null) {
@@ -2248,6 +2258,9 @@ function goToHighlight(id) {
     }
   }, 50);
 }
+
+// Exponer al scope global por si acaso
+window.goToHighlight = goToHighlight;
 
 /* Muestra/oculta la barrita "Seleccionar todos / Limpiar" arriba de la lista. */
 function updateSelectionToolbar() {
