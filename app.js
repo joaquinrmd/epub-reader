@@ -1096,6 +1096,7 @@ async function parseAndReplaceBookContent(bookId, file) {
 
     const spineIds = [...opfText.matchAll(/idref="([^"]+)"/g)].map(m => m[1]);
     const chapterTitles = await extractChapterTitles(zip, manifest, basePath, spineIds);
+    const imageMap = await buildImageMap(zip, manifest, basePath);
     let chapCount = 0;
     for (let i = 0; i < spineIds.length; i++) {
       const item = manifest[spineIds[i]];
@@ -1107,7 +1108,7 @@ async function parseAndReplaceBookContent(bookId, file) {
       const raw  = await hf.async('text');
       const body = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
       if (!body) continue;
-      const cleaned = cleanEpubHtml(body[1]);
+      const cleaned = cleanEpubHtml(inlineImagesInHtml(body[1], imageMap));
       if (!cleaned.trim()) continue;
       chapters.push({
         index: chapCount++,
@@ -1221,6 +1222,7 @@ async function loadEpub(file) {
   // 5. Spine + títulos de capítulos
   const spineIds      = [...opfText.matchAll(/idref="([^"]+)"/g)].map(m => m[1]);
   const chapterTitles = await extractChapterTitles(zip, manifest, basePath, spineIds);
+  const imageMap      = await buildImageMap(zip, manifest, basePath);
   let chapCount = 0;
 
   for (let i = 0; i < spineIds.length; i++) {
@@ -1233,7 +1235,7 @@ async function loadEpub(file) {
     const raw  = await hf.async('text');
     const body = raw.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
     if (!body) continue;
-    const cleaned = cleanEpubHtml(body[1]);
+    const cleaned = cleanEpubHtml(inlineImagesInHtml(body[1], imageMap));
     if (!cleaned.trim()) continue;
     chapters.push({
       index: chapCount++,
@@ -1334,12 +1336,44 @@ function cleanEpubHtml(html) {
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<link[^>]*>/gi, '')
-    .replace(/<img[^>]*>/gi, '')
     .replace(/class="[^"]*"/gi, '')
     .replace(/style="[^"]*"/gi, '')
     .replace(/<\/?(?:html|head|body|meta|title)[^>]*>/gi, '')
-    .replace(/<br\s*\/?>/gi, ' ')
     .trim();
+}
+
+/* Construye un mapa de imágenes del EPUB → data URI base64.
+   Indexa por path completo (relativo al OPF) y por basename para que
+   matchee distintas formas de referencia (../images/x.jpg, images/x.jpg, x.jpg). */
+async function buildImageMap(zip, manifest, basePath) {
+  const map = {};
+  for (const item of Object.values(manifest)) {
+    if (!item.mediaType || !item.mediaType.startsWith('image/')) continue;
+    try {
+      const fullPath = resolvePath(basePath, item.href);
+      const f = zip.files[fullPath]
+        || zip.files[Object.keys(zip.files).find(k => k.endsWith(item.href))];
+      if (!f) continue;
+      const bytes = await f.async('base64');
+      const dataUri = `data:${item.mediaType};base64,${bytes}`;
+      map[item.href.toLowerCase()] = dataUri;
+      map[item.href.split('/').pop().toLowerCase()] = dataUri;
+    } catch (e) { /* ref rota, ignorar */ }
+  }
+  return map;
+}
+
+/* Reemplaza los src="..." de <img> por sus data URIs. Si no se encuentra,
+   se elimina el <img> (referencia rota). */
+function inlineImagesInHtml(html, imageMap) {
+  return html.replace(/<img\b([^>]*?)\bsrc=(['"])([^'"]+)\2([^>]*)>/gi,
+    (m, before, q, src, after) => {
+      const norm = src.replace(/^\.\.?\//, '').replace(/^\//, '').toLowerCase();
+      const base = src.split('/').pop().toLowerCase();
+      const dataUri = imageMap[src.toLowerCase()] || imageMap[norm] || imageMap[base];
+      if (dataUri) return `<img${before}src="${dataUri}"${after}>`;
+      return '';
+    });
 }
 
 async function loadTxt(file) {
@@ -1512,8 +1546,12 @@ function mountEmptyBook(msg) {
 //  CONSTRUCCIÓN DEL ARRAY DE PÁRRAFOS
 // ════════════════════════════════════════════════════════════════
 
-const SKIP_TAGS = new Set(['script','style','head','nav','aside','figure','svg']);
+const SKIP_TAGS = new Set(['script','style','head','svg']);
 const PARA_TAGS = new Set(['p','h1','h2','h3','h4','h5','h6','blockquote','pre','li','dt','dd']);
+const BLOCK_WRAPPERS = new Set(['div','section','article','figure','main','aside','nav','header','footer']);
+const PARA_QUERY = 'p,h1,h2,h3,h4,h5,h6,blockquote,pre,li,dt,dd';
+
+let pendingAnchorIds = [];
 
 function buildParagraphArray(chapters) {
   allParagraphs = []; anchorMap = {}; fileChapterMap = {};
@@ -1522,6 +1560,7 @@ function buildParagraphArray(chapters) {
     if (ch.filename) fileChapterMap[ch.filename.toLowerCase()] = ci;
     const div = document.createElement('div');
     div.innerHTML = ch.html;
+    pendingAnchorIds = [];
     extractBlocks(div, ci);
   }
 }
@@ -1530,27 +1569,56 @@ function extractBlocks(node, ci) {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent.trim();
     const pt   = node.parentNode && node.parentNode.tagName ? node.parentNode.tagName.toLowerCase() : '';
-    if (text && !PARA_TAGS.has(pt)) addPara(`<p>${escHtml(text)}</p>`, ci, []);
+    if (text && !PARA_TAGS.has(pt)) {
+      const ids = pendingAnchorIds; pendingAnchorIds = [];
+      addPara(`<p>${escHtml(text)}</p>`, ci, ids);
+    }
     return;
   }
   if (node.nodeType !== Node.ELEMENT_NODE) return;
   const tag = node.tagName.toLowerCase();
   if (SKIP_TAGS.has(tag)) return;
+
+  // <p>, <h1>...<h6>, <blockquote>, etc.
   if (PARA_TAGS.has(tag)) {
-    const text = node.textContent.trim();
-    if (!text) return;
     const ids = collectIds(node);
-    addPara(node.outerHTML, ci, ids);
+    const hasContent = node.textContent.trim() || node.querySelector('img');
+    if (!hasContent) {
+      // Párrafo vacío que solo sirve de anchor (ej: <p id="filepos10529"/>)
+      // → guardo los IDs para asignárselos al próximo párrafo real
+      ids.forEach(id => pendingAnchorIds.push(id));
+      return;
+    }
+    const allIds = pendingAnchorIds.concat(ids);
+    pendingAnchorIds = [];
+    addPara(node.outerHTML, ci, allIds);
     return;
   }
-  const hasBlockKids = Array.from(node.children).some(c => PARA_TAGS.has(c.tagName.toLowerCase()));
-  if (hasBlockKids) {
+
+  // <img> suelto → tratarlo como un párrafo-figura
+  if (tag === 'img') {
+    const ids = pendingAnchorIds; pendingAnchorIds = [];
+    addPara(`<p>${node.outerHTML}</p>`, ci, ids);
+    return;
+  }
+
+  // Wrapper genérico (div, section, figure, ...). Decidir entre recursar o
+  // tratar el wrapper como un párrafo hoja.
+  const hasParaDescendant   = node.querySelector(PARA_QUERY) !== null;
+  const hasBlockWrapperKids = Array.from(node.children).some(c => BLOCK_WRAPPERS.has(c.tagName.toLowerCase()));
+
+  if (hasParaDescendant || hasBlockWrapperKids) {
     for (const child of node.childNodes) extractBlocks(child, ci);
   } else {
-    const text = node.textContent.trim();
-    if (!text) return;
-    const ids = collectIds(node);
-    addPara(`<p>${escHtml(text)}</p>`, ci, ids);
+    // Wrapper hoja: solo tiene contenido inline (texto, span, em, br, img, a).
+    // Tratar TODO el wrapper como un párrafo, preservando inline tags.
+    const text   = node.textContent.trim();
+    const hasImg = node.querySelector('img');
+    if (!text && !hasImg) return;
+    const ids    = collectIds(node);
+    const allIds = pendingAnchorIds.concat(ids);
+    pendingAnchorIds = [];
+    addPara(`<p>${node.innerHTML}</p>`, ci, allIds);
   }
 }
 
@@ -1591,16 +1659,19 @@ function renderBookHTML(container) {
 function processLinksForRender(html) {
   return html.replace(/<a(\s[^>]*)?>/gi, (match, attrs) => {
     if (!attrs) return match;
-    const hm = attrs.match(/href="([^"]*)"/i);
+    const hm = attrs.match(/href\s*=\s*"([^"]*)"/i);
     if (!hm) return match;
     const href = hm[1];
+    // Limpiar el href original — si no, quedan dos hrefs y el navegador
+    // usa el primero (la ruta original rota), ignorando nuestro onclick.
+    const cleanAttrs = attrs.replace(/\s*href\s*=\s*"[^"]*"/i, '');
     if (href.startsWith('http') || href.startsWith('mailto:') || href.startsWith('//')) {
-      return `<a${attrs} target="_blank" rel="noopener noreferrer">`;
+      return `<a${cleanAttrs} href="${href}" target="_blank" rel="noopener noreferrer">`;
     }
     const parts  = href.split('#');
     const file   = parts[0] ? parts[0].split('/').pop().toLowerCase() : '';
     const anchor = (parts[1] || '').replace(/'/g, "\\'");
-    return `<a${attrs} href="javascript:void(0)" onclick="handleInternalLink('${anchor}','${file.replace(/'/g, "\\'")}')">`;
+    return `<a${cleanAttrs} href="javascript:void(0)" onclick="handleInternalLink('${anchor}','${file.replace(/'/g, "\\'")}')">`;
   });
 }
 
