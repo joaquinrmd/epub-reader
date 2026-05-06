@@ -3081,16 +3081,6 @@ function updateExportButton() {
 /* Genera el markdown con el formato Literature Note del briefing original. */
 function buildMarkdown(book, highlights) {
   const lines = [];
-  lines.push('---');
-  lines.push('tipo: literatura');
-  lines.push('fuente: libro');
-  if (book.author) lines.push(`autor: ${book.author}`);
-  lines.push('estado: pendiente');
-  lines.push(`exportado: ${new Date().toISOString().split('T')[0]}`);
-  lines.push('---');
-  lines.push('');
-  lines.push(`# ${book.title}`);
-  lines.push('');
   lines.push('## Highlights');
   lines.push('');
   // Ordenar por orden en el libro (paraIdx) si están disponibles, sino por timestamp
